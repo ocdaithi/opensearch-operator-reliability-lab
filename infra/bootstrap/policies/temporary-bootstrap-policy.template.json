@@ -2,13 +2,13 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "CreateAndTagExactStateBucketPrefix",
+      "Sid": "CreateAndTagExactStateBucket",
       "Effect": "Allow",
       "Action": [
         "s3:CreateBucket",
         "s3:TagResource"
       ],
-      "Resource": "arn:aws:s3:::opensearch-lab-tfstate-*",
+      "Resource": "arn:aws:s3:::__STATE_BUCKET_NAME__",
       "Condition": {
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
@@ -47,7 +47,7 @@
         "s3:PutLifecycleConfiguration",
         "s3:UntagResource"
       ],
-      "Resource": "arn:aws:s3:::opensearch-lab-tfstate-*",
+      "Resource": "arn:aws:s3:::__STATE_BUCKET_NAME__",
       "Condition": {
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
@@ -61,7 +61,7 @@
       "Sid": "ListExactTerraformStateKeys",
       "Effect": "Allow",
       "Action": "s3:ListBucket",
-      "Resource": "arn:aws:s3:::opensearch-lab-tfstate-*",
+      "Resource": "arn:aws:s3:::__STATE_BUCKET_NAME__",
       "Condition": {
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
@@ -84,7 +84,7 @@
         "s3:GetObject",
         "s3:PutObject"
       ],
-      "Resource": "arn:aws:s3:::opensearch-lab-tfstate-*/bootstrap/terraform.tfstate",
+      "Resource": "arn:aws:s3:::__STATE_BUCKET_NAME__/bootstrap/terraform.tfstate",
       "Condition": {
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
@@ -102,7 +102,7 @@
         "s3:GetObject",
         "s3:PutObject"
       ],
-      "Resource": "arn:aws:s3:::opensearch-lab-tfstate-*/bootstrap/terraform.tfstate.tflock",
+      "Resource": "arn:aws:s3:::__STATE_BUCKET_NAME__/bootstrap/terraform.tfstate.tflock",
       "Condition": {
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
@@ -122,7 +122,7 @@
         "budgets:UntagResource",
         "budgets:ViewBudget"
       ],
-      "Resource": "arn:aws:budgets::*:budget/opensearch-lab-monthly-cost",
+      "Resource": "arn:aws:budgets::__AWS_ACCOUNT_ID__:budget/opensearch-lab-monthly-cost",
       "Condition": {
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
@@ -147,21 +147,59 @@
       }
     },
     {
-      "Sid": "ManageExactBootstrapRoles",
+      "Sid": "CreateHumanRoleWithBoundary",
       "Effect": "Allow",
       "Action": [
         "iam:CreateRole",
+        "iam:PutRolePolicy"
+      ],
+      "Resource": "arn:aws:iam::__AWS_ACCOUNT_ID__:role/opensearch-lab-terraform-admin",
+      "Condition": {
+        "ArnEquals": {
+          "iam:PermissionsBoundary": "arn:aws:iam::__AWS_ACCOUNT_ID__:policy/opensearch-lab-terraform-admin-boundary"
+        },
+        "ArnLike": {
+          "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+        },
+        "DateLessThan": {
+          "aws:CurrentTime": "__TEMPORARY_POLICY_EXPIRY_UTC__"
+        }
+      }
+    },
+    {
+      "Sid": "CreateGitHubRoleWithBoundary",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:PutRolePolicy"
+      ],
+      "Resource": "arn:aws:iam::__AWS_ACCOUNT_ID__:role/opensearch-lab-github-actions",
+      "Condition": {
+        "ArnEquals": {
+          "iam:PermissionsBoundary": "arn:aws:iam::__AWS_ACCOUNT_ID__:policy/opensearch-lab-github-actions-boundary"
+        },
+        "ArnLike": {
+          "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+        },
+        "DateLessThan": {
+          "aws:CurrentTime": "__TEMPORARY_POLICY_EXPIRY_UTC__"
+        }
+      }
+    },
+    {
+      "Sid": "ReadAndTagExactBootstrapRoles",
+      "Effect": "Allow",
+      "Action": [
         "iam:GetRole",
         "iam:GetRolePolicy",
         "iam:ListAttachedRolePolicies",
         "iam:ListRolePolicies",
         "iam:ListRoleTags",
-        "iam:PutRolePolicy",
         "iam:TagRole"
       ],
       "Resource": [
-        "arn:aws:iam::*:role/opensearch-lab-terraform-admin",
-        "arn:aws:iam::*:role/opensearch-lab-github-actions"
+        "arn:aws:iam::__AWS_ACCOUNT_ID__:role/opensearch-lab-terraform-admin",
+        "arn:aws:iam::__AWS_ACCOUNT_ID__:role/opensearch-lab-github-actions"
       ],
       "Condition": {
         "ArnLike": {
@@ -181,7 +219,7 @@
         "iam:ListOpenIDConnectProviderTags",
         "iam:TagOpenIDConnectProvider"
       ],
-      "Resource": "arn:aws:iam::*:oidc-provider/token.actions.githubusercontent.com",
+      "Resource": "arn:aws:iam::__AWS_ACCOUNT_ID__:oidc-provider/token.actions.githubusercontent.com",
       "Condition": {
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
@@ -192,14 +230,10 @@
       }
     },
     {
-      "Sid": "ManageBootstrapUserRolePermission",
+      "Sid": "ReadExactBootstrapUser",
       "Effect": "Allow",
-      "Action": [
-        "iam:GetUser",
-        "iam:GetUserPolicy",
-        "iam:PutUserPolicy"
-      ],
-      "Resource": "arn:aws:iam::*:user/opensearch-lab-bootstrap",
+      "Action": "iam:GetUser",
+      "Resource": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap",
       "Condition": {
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"

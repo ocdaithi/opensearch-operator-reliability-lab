@@ -15,9 +15,8 @@ for command_name in git mktemp sed; do
 done
 
 state_bucket_name="${TF_STATE_BUCKET_NAME:-}"
-if [[ ${#state_bucket_name} -gt 63 ]] ||
-  [[ ! "${state_bucket_name}" =~ ^opensearch-lab-tfstate-[a-z0-9][a-z0-9.-]*[a-z0-9]$ ]]; then
-  echo "TF_STATE_BUCKET_NAME is missing or invalid." >&2
+if [[ "${state_bucket_name}" != "opensearch-lab-tfstate-ocdaithi-1346323330-eu-west-1" ]]; then
+  echo "TF_STATE_BUCKET_NAME is missing or differs from the deterministic bucket contract." >&2
   exit 1
 fi
 
@@ -28,27 +27,14 @@ template_file="${module_dir}/backend.s3.tf.example"
 backend_file="${module_dir}/backend.tf"
 private_dir="${repository_root}/.private/terraform-bootstrap"
 placeholder="__TF_STATE_BUCKET_NAME__"
+contract_script="${script_dir}/check-backend-contract.sh"
 
 if [[ -e "${backend_file}" ]]; then
   echo "Refusing to replace the existing ignored backend.tf." >&2
   exit 1
 fi
 
-placeholder_count="$(awk -v token="${placeholder}" '
-  {
-    remainder = $0
-    while ((position = index(remainder, token)) > 0) {
-      count++
-      remainder = substr(remainder, position + length(token))
-    }
-  }
-  END { print count + 0 }
-' "${template_file}")"
-
-if [[ "${placeholder_count}" != "1" ]] || grep -Eq 'profile[[:space:]]*=|assume_role' "${template_file}"; then
-  echo "The S3 backend template failed its security invariants." >&2
-  exit 1
-fi
+"${contract_script}" s3-template "${template_file}" >/dev/null
 
 mkdir -p "${private_dir}"
 chmod 700 "${private_dir}"
@@ -58,10 +44,8 @@ trap 'rm -f -- "${temporary_file}"' EXIT
 
 sed "s/${placeholder}/${state_bucket_name}/" "${template_file}" >"${temporary_file}"
 
-if grep -Fq "${placeholder}" "${temporary_file}"; then
-  echo "The rendered backend still contains its placeholder." >&2
-  exit 1
-fi
+TF_STATE_BUCKET_NAME="${state_bucket_name}" \
+  "${contract_script}" s3-resolved "${temporary_file}" >/dev/null
 
 chmod 600 "${temporary_file}"
 mv "${temporary_file}" "${backend_file}"

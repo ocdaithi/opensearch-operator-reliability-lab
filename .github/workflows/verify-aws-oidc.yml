@@ -11,7 +11,7 @@ jobs:
   verify:
     name: Verify role assumption
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: aws-bootstrap
     timeout-minutes: 5
 

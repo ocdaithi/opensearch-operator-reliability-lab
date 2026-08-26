@@ -1,5 +1,5 @@
 resource "aws_s3_bucket" "state" {
-  bucket_prefix = local.state_bucket_prefix
+  bucket        = local.state_bucket_name
   force_destroy = false
 
   lifecycle {
@@ -67,7 +67,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "state" {
     id     = "retain-recent-noncurrent-state"
     status = "Enabled"
 
-    filter {}
+    filter {
+      prefix = ""
+    }
 
     noncurrent_version_expiration {
       newer_noncurrent_versions = 10

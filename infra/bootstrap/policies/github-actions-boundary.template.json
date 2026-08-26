@@ -1,0 +1,38 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListExactTerraformStateKeys",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:__AWS_PARTITION__:s3:::__STATE_BUCKET_NAME__",
+      "Condition": {
+        "StringEquals": {
+          "s3:prefix": [
+            "bootstrap/terraform.tfstate",
+            "bootstrap/terraform.tfstate.tflock"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ReadAndWriteTerraformState",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:__AWS_PARTITION__:s3:::__STATE_BUCKET_NAME__/bootstrap/terraform.tfstate"
+    },
+    {
+      "Sid": "ManageTerraformStateLock",
+      "Effect": "Allow",
+      "Action": [
+        "s3:DeleteObject",
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:__AWS_PARTITION__:s3:::__STATE_BUCKET_NAME__/bootstrap/terraform.tfstate.tflock"
+    }
+  ]
+}

@@ -24,6 +24,7 @@ resource "aws_iam_role" "terraform_admin" {
   path                 = "/"
   description          = "Manages the reviewed AWS bootstrap foundation through Terraform."
   assume_role_policy   = data.aws_iam_policy_document.terraform_admin_trust.json
+  permissions_boundary = local.terraform_admin_boundary_arn
   max_session_duration = 3600
 }
 
@@ -52,7 +53,6 @@ data "aws_iam_policy_document" "terraform_admin" {
       "s3:ListBucket",
       "s3:ListTagsForResource",
       "s3:PutBucketOwnershipControls",
-      "s3:PutBucketPolicy",
       "s3:PutBucketPublicAccessBlock",
       "s3:PutBucketVersioning",
       "s3:PutEncryptionConfiguration",
@@ -73,7 +73,7 @@ data "aws_iam_policy_document" "terraform_admin" {
       "budgets:UntagResource",
       "budgets:ViewBudget",
     ]
-    resources = [aws_budgets_budget.account_cost.arn]
+    resources = [local.budget_arn]
   }
 
   statement {
@@ -110,17 +110,30 @@ data "aws_iam_policy_document" "terraform_admin" {
   }
 
   statement {
-    sid    = "ReadBootstrapUserRolePermission"
+    sid    = "AuditExactBootstrapUser"
     effect = "Allow"
     actions = [
       "iam:GetUser",
-      "iam:GetUserPolicy",
       "iam:ListAccessKeys",
       "iam:ListAttachedUserPolicies",
       "iam:ListGroupsForUser",
+      "iam:ListMFADevices",
       "iam:ListUserPolicies",
     ]
     resources = [data.aws_iam_user.bootstrap.arn]
+  }
+
+  statement {
+    sid    = "ReadExactPermissionsBoundaries"
+    effect = "Allow"
+    actions = [
+      "iam:GetPolicy",
+      "iam:GetPolicyVersion",
+    ]
+    resources = [
+      local.terraform_admin_boundary_arn,
+      local.github_actions_boundary_arn,
+    ]
   }
 
   statement {
@@ -153,19 +166,4 @@ resource "aws_iam_role_policy" "terraform_admin" {
   name   = "opensearch-lab-bootstrap-management"
   role   = aws_iam_role.terraform_admin.id
   policy = data.aws_iam_policy_document.terraform_admin.json
-}
-
-data "aws_iam_policy_document" "bootstrap_user_assume_role" {
-  statement {
-    sid       = "AssumeExactTerraformAdminRole"
-    effect    = "Allow"
-    actions   = ["sts:AssumeRole"]
-    resources = [aws_iam_role.terraform_admin.arn]
-  }
-}
-
-resource "aws_iam_user_policy" "bootstrap_user_assume_role" {
-  name   = "opensearch-lab-assume-terraform-admin"
-  user   = data.aws_iam_user.bootstrap.user_name
-  policy = data.aws_iam_policy_document.bootstrap_user_assume_role.json
 }
