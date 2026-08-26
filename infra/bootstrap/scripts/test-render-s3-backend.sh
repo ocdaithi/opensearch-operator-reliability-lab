@@ -34,7 +34,10 @@ rendered_backend="${success_fixture}/infra/bootstrap/backend.tf"
 grep -Fq 'bucket       = "opensearch-lab-tfstate-synthetic"' "${rendered_backend}"
 grep -Fq 'key          = "bootstrap/terraform.tfstate"' "${rendered_backend}"
 grep -Fq 'use_lockfile = true' "${rendered_backend}"
-! grep -Eq '__TF_STATE_BUCKET_NAME__|profile[[:space:]]*=|assume_role' "${rendered_backend}"
+if grep -Eq '__TF_STATE_BUCKET_NAME__|profile[[:space:]]*=|assume_role' "${rendered_backend}"; then
+  echo "Rendered backend contains an unresolved or local-only setting." >&2
+  exit 1
+fi
 git -C "${success_fixture}" check-ignore -q "${rendered_backend}"
 
 if stat -f '%Lp' "${rendered_backend}" >/dev/null 2>&1; then

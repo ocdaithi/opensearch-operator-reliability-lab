@@ -20,7 +20,7 @@ template_file="${repository_root}/infra/bootstrap/policies/temporary-bootstrap-p
 private_dir="${repository_root}/.private/terraform-bootstrap"
 output_file="${private_dir}/temporary-bootstrap-policy.json"
 expiry_sentinel="__TEMPORARY_POLICY_EXPIRY_UTC__"
-sign_in_pattern='arn:aws:signin:*:${aws:PrincipalAccount}:session/*'
+sign_in_pattern="arn:aws:signin:*:\${aws:PrincipalAccount}:session/*"
 
 mkdir -p "${private_dir}"
 chmod 700 "${private_dir}"
