@@ -217,6 +217,25 @@ run "github_oidc_trust_is_exact" {
     )
     error_message = "The GitHub role trust must require the exact immutable repository environment subject and STS audience without wildcards."
   }
+
+  assert {
+    condition = jsondecode(data.aws_iam_policy_document.github_actions_trust.json) == jsondecode(jsonencode({
+      Version = "2012-10-17"
+      Statement = [{
+        Sid       = "AllowExactRepositoryEnvironment"
+        Effect    = "Allow"
+        Action    = "sts:AssumeRoleWithWebIdentity"
+        Principal = { Federated = aws_iam_openid_connect_provider.github.arn }
+        Condition = {
+          StringEquals = {
+            "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+            "token.actions.githubusercontent.com:sub" = "repo:ocdaithi@321047870/opensearch-operator-reliability-lab@1346323330:environment:aws-bootstrap"
+          }
+        }
+      }]
+    }))
+    error_message = "The raw GitHub trust-policy document must match the exact reviewed contract."
+  }
 }
 
 run "github_state_access_is_exact" {
@@ -361,6 +380,24 @@ run "human_access_is_exact" {
       !contains(keys(jsondecode(aws_iam_role.terraform_admin.assume_role_policy).Statement[0]), "NotResource")
     )
     error_message = "The human role trust must allow only the named bootstrap user through an AWS Sign-In session."
+  }
+
+  assert {
+    condition = jsondecode(data.aws_iam_policy_document.terraform_admin_trust.json) == jsondecode(jsonencode({
+      Version = "2012-10-17"
+      Statement = [{
+        Sid       = "AllowExactBootstrapUser"
+        Effect    = "Allow"
+        Action    = "sts:AssumeRole"
+        Principal = { AWS = data.aws_iam_user.bootstrap.arn }
+        Condition = {
+          ArnLike = {
+            "aws:SignInSessionArn" = "arn:aws:signin:*:${data.aws_caller_identity.current.account_id}:session/*"
+          }
+        }
+      }]
+    }))
+    error_message = "The raw human trust-policy document must match the exact reviewed contract."
   }
 
   assert {
@@ -584,21 +621,46 @@ run "budget_contract_is_exact" {
 
   assert {
     condition = (
+      aws_budgets_budget.account_cost.name == "opensearch-lab-monthly-cost" &&
+      aws_budgets_budget.account_cost.account_id == data.aws_caller_identity.current.account_id &&
       aws_budgets_budget.account_cost.budget_type == "COST" &&
       aws_budgets_budget.account_cost.limit_amount == "50" &&
       aws_budgets_budget.account_cost.limit_unit == "USD" &&
       aws_budgets_budget.account_cost.time_unit == "MONTHLY" &&
       toset(aws_budgets_budget.account_cost.metrics) == toset(["UnblendedCost"])
     )
-    error_message = "The account budget must remain a monthly USD 50 unblended-cost budget."
+    error_message = "The account budget must keep its exact name, account and monthly USD 50 unblended-cost limit."
   }
 
   assert {
     condition = (
+      aws_budgets_budget.account_cost.billing_view_arn == null &&
+      length(aws_budgets_budget.account_cost.auto_adjust_data) == 0 &&
+      length(aws_budgets_budget.account_cost.planned_limit) == 0 &&
+      length(aws_budgets_budget.account_cost.cost_filter) == 0 &&
+      length(aws_budgets_budget.account_cost.cost_types) == 0
+    )
+    error_message = "The planned account budget must not use a billing view, adjustment, planned limit or legacy cost filter."
+  }
+
+  assert {
+    condition = (
+      length(aws_budgets_budget.account_cost.filter_expression) == 1 &&
       length(one(aws_budgets_budget.account_cost.filter_expression).not) == 1 &&
+      length(one(aws_budgets_budget.account_cost.filter_expression).and) == 0 &&
+      length(one(aws_budgets_budget.account_cost.filter_expression).or) == 0 &&
+      length(one(aws_budgets_budget.account_cost.filter_expression).dimensions) == 0 &&
+      length(one(aws_budgets_budget.account_cost.filter_expression).tags) == 0 &&
+      length(one(aws_budgets_budget.account_cost.filter_expression).cost_categories) == 0 &&
       length(one(aws_budgets_budget.account_cost.filter_expression).not[0].dimensions) == 1 &&
+      length(one(aws_budgets_budget.account_cost.filter_expression).not[0].and) == 0 &&
+      length(one(aws_budgets_budget.account_cost.filter_expression).not[0].or) == 0 &&
+      length(one(aws_budgets_budget.account_cost.filter_expression).not[0].not) == 0 &&
+      length(one(aws_budgets_budget.account_cost.filter_expression).not[0].tags) == 0 &&
+      length(one(aws_budgets_budget.account_cost.filter_expression).not[0].cost_categories) == 0 &&
       one(aws_budgets_budget.account_cost.filter_expression).not[0].dimensions[0].key == "RECORD_TYPE" &&
-      toset(one(aws_budgets_budget.account_cost.filter_expression).not[0].dimensions[0].values) == toset(["Credit", "Refund"])
+      toset(one(aws_budgets_budget.account_cost.filter_expression).not[0].dimensions[0].values) == toset(["Credit", "Refund"]) &&
+      length(one(aws_budgets_budget.account_cost.filter_expression).not[0].dimensions[0].match_options) == 0
     )
     error_message = "The account budget must exclude only Credit and Refund record types."
   }

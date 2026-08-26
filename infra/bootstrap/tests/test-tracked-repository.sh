@@ -7,7 +7,7 @@ test_root="$(mktemp -d)"
 trap 'rm -rf -- "${test_root}"' EXIT
 negative_case_count=0
 
-for command_name in git mktemp perl zip; do
+for command_name in git grep mktemp perl unzip zip; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "Required command is unavailable: ${command_name}" >&2
     exit 1
@@ -232,6 +232,63 @@ perl -0pi -e 's/permissions:\n  contents: read/permissions:\n  contents: read\n 
 git -C "${token_fixture}" add .
 expect_failure "id-token-expansion" "outside the reviewed AWS OIDC workflow"
 
+oidc_guard_condition_fixture="$(make_fixture oidc-guard-not-always)"
+perl -0pi -e 's/    if: always\(\)/    if: cancelled()/' \
+  "${oidc_guard_condition_fixture}/.github/workflows/verify-aws-oidc.yml"
+grep -Fqx '    if: cancelled()' \
+  "${oidc_guard_condition_fixture}/.github/workflows/verify-aws-oidc.yml"
+git -C "${oidc_guard_condition_fixture}" add .
+expect_failure "oidc-guard-not-always" "guard differs from its reviewed fail-closed contract"
+
+oidc_guard_success_fixture="$(make_fixture oidc-guard-accepts-non-main)"
+perl -0pi -e 's/            exit 1/            exit 0/' \
+  "${oidc_guard_success_fixture}/.github/workflows/verify-aws-oidc.yml"
+grep -Fqx '            exit 0' \
+  "${oidc_guard_success_fixture}/.github/workflows/verify-aws-oidc.yml"
+git -C "${oidc_guard_success_fixture}" add .
+expect_failure "oidc-guard-accepts-non-main" "guard differs from its reviewed fail-closed contract"
+
+oidc_second_token_fixture="$(make_fixture oidc-second-token-job)"
+perl -0pi -e 's/    timeout-minutes: 1/    permissions:\n      id-token: write\n    timeout-minutes: 1/' \
+  "${oidc_second_token_fixture}/.github/workflows/verify-aws-oidc.yml"
+if [[ "$(grep -Fc '      id-token: write' \
+  "${oidc_second_token_fixture}/.github/workflows/verify-aws-oidc.yml")" != "2" ]]; then
+  echo "OIDC second-token mutation was not applied." >&2
+  exit 1
+fi
+git -C "${oidc_second_token_fixture}" add .
+expect_failure "oidc-second-token-job" "differs from its reviewed token boundary"
+
+oidc_guard_environment_fixture="$(make_fixture oidc-environment-on-guard)"
+perl -0pi -e 's/    timeout-minutes: 1/    environment: aws-bootstrap\n    timeout-minutes: 1/' \
+  "${oidc_guard_environment_fixture}/.github/workflows/verify-aws-oidc.yml"
+if [[ "$(grep -Fc '    environment: aws-bootstrap' \
+  "${oidc_guard_environment_fixture}/.github/workflows/verify-aws-oidc.yml")" != "2" ]]; then
+  echo "OIDC guard-environment mutation was not applied." >&2
+  exit 1
+fi
+git -C "${oidc_guard_environment_fixture}" add .
+expect_failure "oidc-environment-on-guard" "guard differs from its reviewed fail-closed contract"
+
+oidc_missing_needs_fixture="$(make_fixture oidc-missing-guard-dependency)"
+perl -0pi -e 's/    needs: guard\n//' \
+  "${oidc_missing_needs_fixture}/.github/workflows/verify-aws-oidc.yml"
+if grep -Fqx '    needs: guard' \
+  "${oidc_missing_needs_fixture}/.github/workflows/verify-aws-oidc.yml"; then
+  echo "OIDC guard-dependency mutation was not applied." >&2
+  exit 1
+fi
+git -C "${oidc_missing_needs_fixture}" add .
+expect_failure "oidc-missing-guard-dependency" "must depend only on the successful guard"
+
+oidc_repository_permission_fixture="$(make_fixture oidc-repository-permission)"
+perl -0pi -e 's/  contents: none/  contents: read/' \
+  "${oidc_repository_permission_fixture}/.github/workflows/verify-aws-oidc.yml"
+grep -Fqx '  contents: read' \
+  "${oidc_repository_permission_fixture}/.github/workflows/verify-aws-oidc.yml"
+git -C "${oidc_repository_permission_fixture}" add .
+expect_failure "oidc-repository-permission" "permissions block differs from its reviewed contract"
+
 permission_fixture="$(make_fixture workflow-write-permission)"
 perl -0pi -e 's/contents: read/contents: write/' \
   "${permission_fixture}/.github/workflows/terraform-validate.yml"
@@ -315,6 +372,19 @@ grep -Fq 'unsafe: { uses: owner/repository/.github/workflows/reuse.yml@main }' \
 git -C "${flow_reusable_fixture}" add .
 expect_failure "flow-reusable-workflow" "Flow-style YAML mappings are not allowed"
 
+external_reusable_fixture="$(make_fixture external-reusable-workflow)"
+external_reusable_sha="$(printf 'd%.0s' {1..40})"
+printf '%s\n' \
+  '  external:' \
+  '    name: Unreviewed external workflow' \
+  "    uses: owner/repository/.github/workflows/reuse.yml@${external_reusable_sha}" \
+  >>"${external_reusable_fixture}/.github/workflows/terraform-validate.yml"
+grep -Fqx \
+  "    uses: owner/repository/.github/workflows/reuse.yml@${external_reusable_sha}" \
+  "${external_reusable_fixture}/.github/workflows/terraform-validate.yml"
+git -C "${external_reusable_fixture}" add .
+expect_failure "external-reusable-workflow" "External reusable-workflow jobs are not allowed"
+
 anchored_flow_fixture="$(make_fixture anchored-flow-job)"
 printf '%s\n' \
   '  unsafe: &job { runs-on: ubuntu-latest, steps: [{ run: true }] }' \
@@ -338,6 +408,18 @@ printf '%s\n' \
 git -C "${artifact_fixture}" add .
 expect_failure "repository-artifact-upload" "Artifact upload actions require"
 
+mixed_case_artifact_fixture="$(make_fixture mixed-case-artifact-upload)"
+printf '%s\n' \
+  '      - name: Upload repository with mixed case' \
+  "        uses: Actions/Upload-Artifact@${action_sha}" \
+  '        with:' \
+  '          path: .' \
+  >>"${mixed_case_artifact_fixture}/.github/workflows/terraform-validate.yml"
+grep -Fqx "        uses: Actions/Upload-Artifact@${action_sha}" \
+  "${mixed_case_artifact_fixture}/.github/workflows/terraform-validate.yml"
+git -C "${mixed_case_artifact_fixture}" add .
+expect_failure "mixed-case-artifact-upload" "Artifact upload actions require"
+
 account_fixture="$(make_fixture account-specific-iam-arn)"
 account_id="$(printf '%s%s%s' 1234 5678 9012)"
 printf 'arn:aws:iam::%s:role/synthetic\n' "${account_id}" \
@@ -345,10 +427,31 @@ printf 'arn:aws:iam::%s:role/synthetic\n' "${account_id}" \
 git -C "${account_fixture}" add .
 expect_failure "account-specific-iam-arn" "account-specific IAM ARN"
 
+binary_arn_fixture="$(make_fixture binary-account-specific-iam-arn)"
+binary_arn="arn:aws:iam::${account_id}:role/synthetic"
+printf '\0%s\n' "${binary_arn}" >"${binary_arn_fixture}/record.bin"
+if grep -Iq '' "${binary_arn_fixture}/record.bin" ||
+  ! grep -aFq "${binary_arn}" "${binary_arn_fixture}/record.bin"; then
+  echo "Binary IAM ARN mutation was not applied." >&2
+  exit 1
+fi
+git -C "${binary_arn_fixture}" add .
+expect_failure "binary-account-specific-iam-arn" "account-specific IAM ARN"
+
 bare_account_fixture="$(make_fixture bare-account-id)"
 printf '%s\n' "${account_id}" >"${bare_account_fixture}/account.txt"
 git -C "${bare_account_fixture}" add .
 expect_failure "bare-account-id" "possible AWS account ID"
+
+binary_account_fixture="$(make_fixture binary-account-id)"
+printf '\0%s\n' "${account_id}" >"${binary_account_fixture}/record.bin"
+if grep -Iq '' "${binary_account_fixture}/record.bin" ||
+  ! grep -aFq "${account_id}" "${binary_account_fixture}/record.bin"; then
+  echo "Binary account-ID mutation was not applied." >&2
+  exit 1
+fi
+git -C "${binary_account_fixture}" add .
+expect_failure "binary-account-id" "possible AWS account ID"
 
 credential_fixture="$(make_fixture aws-access-key)"
 credential_prefix="$(printf '%s%s' AK IA)"
@@ -357,6 +460,18 @@ printf 'credential=%s%s\n' "${credential_prefix}" "${credential_suffix}" \
   >"${credential_fixture}/credential.txt"
 git -C "${credential_fixture}" add .
 expect_failure "aws-access-key" "AWS access-key identifier"
+
+binary_credential_fixture="$(make_fixture binary-aws-access-key)"
+binary_credential="${credential_prefix}${credential_suffix}"
+printf '\0credential=%s\n' "${binary_credential}" \
+  >"${binary_credential_fixture}/record.bin"
+if grep -Iq '' "${binary_credential_fixture}/record.bin" ||
+  ! grep -aFq "${binary_credential}" "${binary_credential_fixture}/record.bin"; then
+  echo "Binary AWS credential mutation was not applied." >&2
+  exit 1
+fi
+git -C "${binary_credential_fixture}" add .
+expect_failure "binary-aws-access-key" "AWS access-key identifier"
 
 secret_fixture="$(make_fixture aws-secret-access-key)"
 secret_variable="$(printf '%s%s' AWS_SECRET_ ACCESS_KEY)"
@@ -440,6 +555,17 @@ printf '%s\n' \
 git -C "${disguised_state_text_fixture}" add .
 expect_failure "disguised-state-text" "state content is tracked under a disguised filename"
 
+binary_state_fixture="$(make_fixture binary-disguised-state)"
+binary_state_payload='{"version":4,"terraform_version":"1.15.9","serial":1,"lineage":"synthetic","resources":[]}'
+printf '\0%s\n' "${binary_state_payload}" >"${binary_state_fixture}/evidence.bin"
+if grep -Iq '' "${binary_state_fixture}/evidence.bin" ||
+  ! grep -aFq '"lineage":"synthetic"' "${binary_state_fixture}/evidence.bin"; then
+  echo "Binary Terraform state mutation was not applied." >&2
+  exit 1
+fi
+git -C "${binary_state_fixture}" add .
+expect_failure "binary-disguised-state" "state content is tracked in a binary-classified file"
+
 disguised_plan_fixture="$(make_fixture disguised-plan-archive)"
 plan_payload="${disguised_plan_fixture}/plan-payload"
 mkdir -p "${plan_payload}"
@@ -453,12 +579,36 @@ printf 'synthetic previous state\n' >"${plan_payload}/tfstate-prev"
 git -C "${disguised_plan_fixture}" add review.plan
 expect_failure "disguised-plan-archive" "plan archive is tracked under a disguised filename"
 
+nested_state_archive_fixture="$(make_fixture nested-state-archive)"
+nested_archive_payload="${nested_state_archive_fixture}/archive-payload"
+mkdir -p "${nested_archive_payload}/nested"
+printf 'synthetic state\n' >"${nested_archive_payload}/nested/terraform.tfstate"
+(
+  cd "${nested_archive_payload}"
+  zip -q "${nested_state_archive_fixture}/review.zip" nested/terraform.tfstate
+)
+unzip -Z1 "${nested_state_archive_fixture}/review.zip" |
+  grep -Fqx 'nested/terraform.tfstate'
+git -C "${nested_state_archive_fixture}" add review.zip
+expect_failure "nested-state-archive" "archive contains a prohibited generated, private, state or plan artefact"
+
 disguised_plan_json_fixture="$(make_fixture disguised-plan-json)"
 printf '%s\n' \
   '{"format_version":"1.2","terraform_version":"1.15.9","planned_values":{},"resource_changes":[],"configuration":{}}' \
   >"${disguised_plan_json_fixture}/review.json"
 git -C "${disguised_plan_json_fixture}" add review.json
 expect_failure "disguised-plan-json" "plan JSON is tracked under a disguised filename"
+
+binary_plan_fixture="$(make_fixture binary-disguised-plan-json)"
+binary_plan_payload='{"format_version":"1.2","terraform_version":"1.15.9","planned_values":{},"resource_changes":[],"configuration":{}}'
+printf '\0%s\n' "${binary_plan_payload}" >"${binary_plan_fixture}/review.bin"
+if grep -Iq '' "${binary_plan_fixture}/review.bin" ||
+  ! grep -aFq '"resource_changes":[]' "${binary_plan_fixture}/review.bin"; then
+  echo "Binary Terraform plan mutation was not applied." >&2
+  exit 1
+fi
+git -C "${binary_plan_fixture}" add .
+expect_failure "binary-disguised-plan-json" "plan content is tracked in a binary-classified file"
 
 private_fixture="$(make_fixture tracked-private-file)"
 mkdir -p "${private_fixture}/.private"

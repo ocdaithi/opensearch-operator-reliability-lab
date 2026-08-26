@@ -48,10 +48,14 @@ expect_generation_failure \
   "AWS_ACCOUNT_ID must contain exactly 12 digits." \
   ""
 
+generation_started="$(date -u +%s)"
 AWS_ACCOUNT_ID="${account_id}" \
   "${generator_script}" >/dev/null
+generation_finished="$(date -u +%s)"
 resolved_policy="${test_root}/.private/terraform-bootstrap/temporary-bootstrap-policy.json"
 state_bucket_name="opensearch-lab-tfstate-ocdaithi-1346323330-eu-west-1"
+minimum_expiry=$((generation_started + 14395))
+maximum_expiry=$((generation_finished + 14405))
 
 test -s "${resolved_policy}"
 git -C "${test_root}" check-ignore -q "${resolved_policy}"
@@ -63,7 +67,11 @@ else
 fi
 test "${file_mode}" = "600"
 
-if ! jq -e --arg account_id "${account_id}" --arg bucket "${state_bucket_name}" '
+if ! jq -e \
+  --arg account_id "${account_id}" \
+  --arg bucket "${state_bucket_name}" \
+  --argjson minimum_expiry "${minimum_expiry}" \
+  --argjson maximum_expiry "${maximum_expiry}" '
   def list: if type == "array" then sort else [.] end;
   def statement($sid):
     [.Statement[] | select(.Sid == $sid)]
@@ -71,8 +79,8 @@ if ! jq -e --arg account_id "${account_id}" --arg bucket "${state_bucket_name}" 
   def common_condition:
     .Condition.ArnLike["aws:SignInSessionArn"]
       == "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
-    and (.Condition.DateLessThan["aws:CurrentTime"] | fromdateiso8601) > now
-    and ((.Condition.DateLessThan["aws:CurrentTime"] | fromdateiso8601) - now) <= 14400;
+    and (.Condition.DateLessThan["aws:CurrentTime"] | fromdateiso8601) >= $minimum_expiry
+    and (.Condition.DateLessThan["aws:CurrentTime"] | fromdateiso8601) <= $maximum_expiry;
   def common_keys:
     (keys | sort) == ["Action", "Condition", "Effect", "Resource", "Sid"]
     and (.Condition | keys | sort) == ["ArnLike", "DateLessThan"];

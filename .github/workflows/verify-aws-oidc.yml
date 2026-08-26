@@ -4,14 +4,29 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  id-token: write
+  contents: none
 
 jobs:
+  guard:
+    name: Require the reviewed branch
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+
+    steps:
+      - name: Reject non-main dispatches
+        run: |
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "AWS OIDC verification is restricted to refs/heads/main." >&2
+            exit 1
+          fi
+
   verify:
     name: Verify role assumption
-    if: github.ref == 'refs/heads/main'
+    needs: guard
     runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
     environment: aws-bootstrap
     timeout-minutes: 5
 

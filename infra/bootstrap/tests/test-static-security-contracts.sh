@@ -3,7 +3,20 @@ set -euo pipefail
 
 bootstrap_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 state_file="$bootstrap_dir/state.tf"
+structure_inspector="$bootstrap_dir/tests/inspect-hcl-structure.py"
 shopt -s nullglob
+
+for command_name in jq python3; do
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    printf 'Required command is unavailable: %s\n' "$command_name" >&2
+    exit 1
+  fi
+done
+
+if [[ ! -f "$structure_inspector" ]]; then
+  printf 'The HCL structure inspector is unavailable.\n' >&2
+  exit 1
+fi
 
 json_configuration=("$bootstrap_dir"/*.tf.json)
 if ((${#json_configuration[@]} != 0)); then
@@ -26,15 +39,12 @@ expected_resources="$(printf '%s\n' \
   aws_s3_bucket_server_side_encryption_configuration.state \
   aws_s3_bucket_versioning.state | sort)"
 
-actual_resources="$(awk '
-  /^[[:space:]]*resource[[:space:]]+"[^"]+"[[:space:]]+"[^"]+"[[:space:]]*\{[[:space:]]*$/ {
-    type = $2
-    name = $3
-    gsub(/"/, "", type)
-    gsub(/"/, "", name)
-    print type "." name
-  }
-' "$bootstrap_dir"/*.tf | sort)"
+if ! structure="$(python3 "$structure_inspector" "$bootstrap_dir"/*.tf)"; then
+  printf 'Unable to inspect the bootstrap HCL structure.\n' >&2
+  exit 1
+fi
+
+actual_resources="$(jq -r '.resources[].address' <<<"$structure" | sort)"
 
 if [[ "$actual_resources" != "$expected_resources" ]]; then
   printf 'Bootstrap resource inventory differs from the reviewed allow-list.\n' >&2
@@ -42,9 +52,46 @@ if [[ "$actual_resources" != "$expected_resources" ]]; then
   exit 1
 fi
 
-module_count="$(awk '/^[[:space:]]*module[[:space:]]+"[^"]+"[[:space:]]*\{[[:space:]]*$/ { count++ } END { print count + 0 }' "$bootstrap_dir"/*.tf)"
+module_count="$(jq '.modules | length' <<<"$structure")"
 if [[ "$module_count" -ne 0 ]]; then
   printf 'Bootstrap configuration must not load unreviewed root modules.\n' >&2
+  exit 1
+fi
+
+if [[ "$(jq '.provisioners | length' <<<"$structure")" -ne 0 ]]; then
+  printf 'Bootstrap resources must not use provisioners.\n' >&2
+  exit 1
+fi
+
+if [[ "$(jq '.ignore_changes | length' <<<"$structure")" -ne 0 ]]; then
+  printf 'Bootstrap resources must not use ignore_changes.\n' >&2
+  exit 1
+fi
+
+if jq -e '
+  any(
+    .attributes[];
+    .resource == "aws_budgets_budget.account_cost"
+      and .parents == ["resource"]
+      and (.name | IN(
+        "name_prefix",
+        "time_period_start",
+        "time_period_end",
+        "billing_view_arn"
+      ))
+  ) or any(
+    .blocks[];
+    .resource == "aws_budgets_budget.account_cost"
+      and .parents == ["resource"]
+      and (.type | IN(
+        "auto_adjust_data",
+        "planned_limit",
+        "cost_filter",
+        "cost_types"
+      ))
+  )
+' <<<"$structure" >/dev/null; then
+  printf 'The account budget must omit optional activation, billing-view and adjustment settings.\n' >&2
   exit 1
 fi
 
@@ -300,4 +347,4 @@ for resource in "${protected_resources[@]}"; do
   fi
 done
 
-printf 'Static bootstrap contracts passed: 13 allowed resources, 2 exact role boundaries, 1 all-object lifecycle filter, 0 modules, 7 destroy guards.\n'
+printf 'Static bootstrap contracts passed: 13 allowed resources, 2 exact role boundaries, 1 exact budget source, 1 all-object lifecycle filter, 0 modules, 0 provisioners, 0 ignore_changes rules, 7 destroy guards.\n'

@@ -32,6 +32,21 @@ The initial Terraform bootstrap will run locally with temporary human credential
 
 Routine provisioning will then move to GitHub Actions OIDC. Provisioning workflows will obtain short-lived credentials instead of storing AWS credentials in GitHub. The human access model, OIDC provider and role, Terraform backend and EKS infrastructure do not yet exist.
 
+## Bootstrap runbook
+
+Complete the following manual prerequisites before creating either AWS role or running OIDC verification:
+
+1. Create the GitHub Environment `aws-bootstrap`.
+2. Restrict its deployment branches and tags to the selected branch `main`.
+3. Store the bootstrap role ARN only in that Environment.
+4. Confirm that fork and other untrusted pull request code cannot receive AWS credentials.
+
+An environment-scoped GitHub OIDC subject does not contain a branch. The Environment deployment-branch rule is therefore the authoritative branch boundary. The workflow's tokenless `main` guard is an additional repository control and does not replace that rule.
+
+Before the initial apply, root must confirm that the exact state bucket and both exact role names do not already exist. Generate the temporary policy immediately before use, attach it only to the exact MFA-protected bootstrap user, which must have no access keys, and apply immediately. Export `BUDGET_NOTIFICATION_EMAIL` with the exact private recipient, then run the independent verifier immediately after apply. Stop if a resource already exists or any result differs from the reviewed contract. Detach and delete the temporary policy immediately after successful verification.
+
+Two bounded first-write risks remain accepted during this initial operation. Temporary `s3:PutBucketPolicy` access to the exact bucket can write its policy before Terraform establishes the reviewed TLS-only policy. Temporary `iam:CreateRole` access to the exact roles accepts each initial trust document before the verifier confirms it. The required permissions boundaries cap what a newly created role can do, but they cannot constrain the initial trust-policy contents. The controls above reduce the exposure window; they do not eliminate either race.
+
 ### Cost and resource lifecycle
 
 The account, Terraform state, diagnostic evidence and ephemeral resources must be reviewed well before the Free Plan ends or its credits are exhausted. This provides time to decide whether to upgrade, retain durable data and remove temporary resources.
@@ -40,4 +55,4 @@ Cost visibility and alerts will be configured before EKS or other material billa
 
 ## Next checkpoint
 
-The next checkpoint is cost and billing safeguards. Temporary human access and the Terraform and OIDC bootstrap will be reviewed afterwards.
+Apply and verify the reviewed bootstrap only after the manual prerequisites above are complete.
