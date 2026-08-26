@@ -31,6 +31,7 @@ data "aws_iam_policy_document" "github_actions_trust" {
 
 resource "aws_iam_role" "github_actions" {
   name                 = local.github_actions_role_name
+  path                 = "/"
   description          = "Reads and updates only the exact Terraform bootstrap state objects."
   assume_role_policy   = data.aws_iam_policy_document.github_actions_trust.json
   max_session_duration = 3600

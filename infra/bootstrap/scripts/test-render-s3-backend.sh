@@ -5,6 +5,12 @@ set -euo pipefail
 source_root="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 test_root="$(mktemp -d)"
 trap 'rm -rf -- "${test_root}"' EXIT
+negative_case_count=0
+
+record_negative_case() {
+  negative_case_count=$((negative_case_count + 1))
+  printf 'negative case: %s\n' "$1"
+}
 
 make_fixture() {
   fixture_name="$1"
@@ -43,6 +49,7 @@ if "${missing_fixture}/infra/bootstrap/scripts/render-s3-backend.sh" >/dev/null 
   echo "Backend rendering unexpectedly accepted a missing bucket name." >&2
   exit 1
 fi
+record_negative_case "missing-bucket-name"
 
 invalid_fixture="$(make_fixture invalid)"
 if TF_STATE_BUCKET_NAME=unrelated-bucket \
@@ -50,6 +57,7 @@ if TF_STATE_BUCKET_NAME=unrelated-bucket \
   echo "Backend rendering unexpectedly accepted an invalid bucket name." >&2
   exit 1
 fi
+record_negative_case "unexpected-bucket-name"
 
 if TF_STATE_BUCKET_NAME=opensearch-lab-tfstate-replacement \
   "${success_fixture}/infra/bootstrap/scripts/render-s3-backend.sh" >/dev/null 2>&1; then
@@ -57,5 +65,7 @@ if TF_STATE_BUCKET_NAME=opensearch-lab-tfstate-replacement \
   exit 1
 fi
 grep -Fq 'bucket       = "opensearch-lab-tfstate-synthetic"' "${rendered_backend}"
+record_negative_case "existing-backend-replacement"
 
-echo "S3 backend rendering safeguards passed."
+printf 'S3 backend rendering safeguards passed (%d negative cases).\n' \
+  "${negative_case_count}"

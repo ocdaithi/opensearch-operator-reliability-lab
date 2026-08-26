@@ -7,6 +7,7 @@ test_root="$(mktemp -d)"
 trap 'rm -rf -- "${test_root}"' EXIT
 account_id="$(printf '%06d%06d' 123 456)"
 fixture_root="${test_root}/fixture"
+negative_case_count=0
 
 mkdir -p \
   "${fixture_root}/bin" \
@@ -162,11 +163,16 @@ temporary_policy="${FAKE_FIXTURE_ROOT}/.private/terraform-bootstrap/temporary-bo
 
 case "$*" in
   *" sts get-caller-identity "*)
-    jq -nc --arg account_id "${account_id}" '{
+    if [[ "${FAKE_SCENARIO:-}" == "wrong-caller-role" ]]; then
+      caller_role="opensearch-lab-github-actions"
+    else
+      caller_role="opensearch-lab-terraform-admin"
+    fi
+    jq -nc --arg account_id "${account_id}" --arg caller_role "${caller_role}" '{
       Account: $account_id,
       Arn: (
         "arn:aws:sts::" + $account_id
-        + ":assumed-role/opensearch-lab-terraform-admin/verification"
+        + ":assumed-role/" + $caller_role + "/verification"
       ),
       UserId: "synthetic"
     }'
@@ -279,7 +285,7 @@ case "$*" in
     }'
     ;;
   *" iam get-policy "*)
-    if [[ "${FAKE_PHASE}" == "after" ]]; then
+    if [[ "${FAKE_PHASE}" == "after" && "${FAKE_SCENARIO:-}" != "temporary-policy-still-exists" ]]; then
       echo 'An error occurred (NoSuchEntity) when calling the GetPolicy operation' >&2
       exit 254
     fi
@@ -310,6 +316,19 @@ run_verification() {
 run_verification before >/dev/null
 run_verification after >/dev/null
 
+expect_verification_failure() {
+  phase="$1"
+  scenario="$2"
+
+  if run_verification "${phase}" "${scenario}" >/dev/null 2>&1; then
+    echo "Access verification accepted scenario: ${scenario}" >&2
+    exit 1
+  fi
+
+  negative_case_count=$((negative_case_count + 1))
+  printf 'negative case: %s\n' "${scenario}"
+}
+
 for failing_scenario in \
   access-key \
   changed-temporary-policy \
@@ -318,11 +337,12 @@ for failing_scenario in \
   extra-user-policy \
   group \
   user-boundary \
+  wrong-caller-role \
   wrong-trust; do
-  if run_verification before "${failing_scenario}" >/dev/null 2>&1; then
-    echo "Access verification accepted scenario: ${failing_scenario}" >&2
-    exit 1
-  fi
+  expect_verification_failure before "${failing_scenario}"
 done
 
-echo "Bootstrap access allow-list safeguards passed."
+expect_verification_failure after temporary-policy-still-exists
+
+printf 'Bootstrap access allow-list safeguards passed (%d negative cases).\n' \
+  "${negative_case_count}"

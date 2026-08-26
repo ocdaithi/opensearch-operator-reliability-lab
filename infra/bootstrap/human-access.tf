@@ -21,6 +21,7 @@ data "aws_iam_policy_document" "terraform_admin_trust" {
 
 resource "aws_iam_role" "terraform_admin" {
   name                 = local.terraform_admin_role_name
+  path                 = "/"
   description          = "Manages the reviewed AWS bootstrap foundation through Terraform."
   assume_role_policy   = data.aws_iam_policy_document.terraform_admin_trust.json
   max_session_duration = 3600

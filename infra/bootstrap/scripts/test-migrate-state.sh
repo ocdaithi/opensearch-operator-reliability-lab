@@ -5,6 +5,12 @@ set -euo pipefail
 source_root="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 test_root="$(mktemp -d)"
 trap 'rm -rf -- "${test_root}"' EXIT
+negative_case_count=0
+
+record_negative_case() {
+  negative_case_count=$((negative_case_count + 1))
+  printf 'negative case: %s\n' "$1"
+}
 
 make_fixture() {
   fixture_name="$1"
@@ -50,7 +56,27 @@ case "$*" in
     fi
     ;;
   *" state pull")
-    printf '{"lineage":"fixture-lineage","serial":4}\n'
+    fixture_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    if grep -Fq 'backend "s3"' "${fixture_root}/infra/bootstrap/backend.tf"; then
+      case "${FAKE_STATE_VERIFICATION:-valid}" in
+        lineage-mismatch)
+          printf '{"lineage":"unexpected-lineage","serial":4}\n'
+          ;;
+        serial-regression)
+          printf '{"lineage":"fixture-lineage","serial":3}\n'
+          ;;
+        *)
+          printf '{"lineage":"fixture-lineage","serial":4}\n'
+          ;;
+      esac
+    else
+      printf '{"lineage":"fixture-lineage","serial":4}\n'
+    fi
+    ;;
+  *" plan "*)
+    if [[ "${FAKE_PLAN_FAILURE:-false}" == "true" ]]; then
+      exit 44
+    fi
     ;;
   *" output -raw state_bucket_name")
     printf 'opensearch-lab-tfstate-fixture\n'
@@ -90,6 +116,30 @@ grep -Eq '^arn:aws:iam::[0-9]{12}:role/opensearch-lab-terraform-admin\|.* plan '
 grep -Fq 's3api list-objects-v2 --profile opensearch-lab-terraform' "${success_log}"
 test -s "$(find "${success_fixture}/.private/terraform-bootstrap" -name 'pre-migration-*.tfstate' -print -quit)"
 
+approval_fixture="$(make_fixture approval)"
+cp "${approval_fixture}/infra/bootstrap/backend.tf" "${approval_fixture}/expected-backend.tf"
+if PATH="${approval_fixture}/bin:${PATH}" \
+  FAKE_LOG="${approval_fixture}/commands.log" \
+  "${approval_fixture}/infra/bootstrap/scripts/migrate-state.sh" >/dev/null 2>&1; then
+  echo "Migration unexpectedly ran without explicit approval." >&2
+  exit 1
+fi
+cmp -s "${approval_fixture}/expected-backend.tf" "${approval_fixture}/infra/bootstrap/backend.tf"
+record_negative_case "missing-explicit-approval"
+
+backend_fixture="$(make_fixture unexpected-backend)"
+printf 'terraform { backend "local" { path = "unexpected.tfstate" } }\n' \
+  >"${backend_fixture}/infra/bootstrap/backend.tf"
+cp "${backend_fixture}/infra/bootstrap/backend.tf" "${backend_fixture}/expected-backend.tf"
+if PATH="${backend_fixture}/bin:${PATH}" \
+  FAKE_LOG="${backend_fixture}/commands.log" \
+  "${backend_fixture}/infra/bootstrap/scripts/migrate-state.sh" --approved >/dev/null 2>&1; then
+  echo "Migration unexpectedly accepted an unrecognised local backend." >&2
+  exit 1
+fi
+cmp -s "${backend_fixture}/expected-backend.tf" "${backend_fixture}/infra/bootstrap/backend.tf"
+record_negative_case "unexpected-local-backend"
+
 occupied_fixture="$(make_fixture occupied)"
 cp "${occupied_fixture}/infra/bootstrap/backend.tf" "${occupied_fixture}/expected-backend.tf"
 if PATH="${occupied_fixture}/bin:${PATH}" \
@@ -100,6 +150,7 @@ if PATH="${occupied_fixture}/bin:${PATH}" \
   exit 1
 fi
 cmp -s "${occupied_fixture}/expected-backend.tf" "${occupied_fixture}/infra/bootstrap/backend.tf"
+record_negative_case "occupied-remote-destination"
 
 rollback_fixture="$(make_fixture rollback)"
 cp "${rollback_fixture}/infra/bootstrap/backend.tf" "${rollback_fixture}/expected-backend.tf"
@@ -111,6 +162,45 @@ if PATH="${rollback_fixture}/bin:${PATH}" \
   exit 1
 fi
 cmp -s "${rollback_fixture}/expected-backend.tf" "${rollback_fixture}/infra/bootstrap/backend.tf"
+record_negative_case "migration-command-failure"
+
+lineage_fixture="$(make_fixture lineage-mismatch)"
+cp "${lineage_fixture}/infra/bootstrap/backend.tf" "${lineage_fixture}/expected-backend.tf"
+if PATH="${lineage_fixture}/bin:${PATH}" \
+  FAKE_LOG="${lineage_fixture}/commands.log" \
+  FAKE_STATE_VERIFICATION=lineage-mismatch \
+  "${lineage_fixture}/infra/bootstrap/scripts/migrate-state.sh" --approved >/dev/null 2>&1; then
+  echo "Migration unexpectedly accepted a changed state lineage." >&2
+  exit 1
+fi
+cmp -s "${lineage_fixture}/expected-backend.tf" "${lineage_fixture}/infra/bootstrap/backend.tf"
+record_negative_case "state-lineage-mismatch"
+
+serial_fixture="$(make_fixture serial-regression)"
+cp "${serial_fixture}/infra/bootstrap/backend.tf" "${serial_fixture}/expected-backend.tf"
+if PATH="${serial_fixture}/bin:${PATH}" \
+  FAKE_LOG="${serial_fixture}/commands.log" \
+  FAKE_STATE_VERIFICATION=serial-regression \
+  "${serial_fixture}/infra/bootstrap/scripts/migrate-state.sh" --approved >/dev/null 2>&1; then
+  echo "Migration unexpectedly accepted a regressed state serial." >&2
+  exit 1
+fi
+cmp -s "${serial_fixture}/expected-backend.tf" "${serial_fixture}/infra/bootstrap/backend.tf"
+record_negative_case "state-serial-regression"
+
+plan_fixture="$(make_fixture plan-failure)"
+cp "${plan_fixture}/infra/bootstrap/backend.tf" "${plan_fixture}/expected-backend.tf"
+if PATH="${plan_fixture}/bin:${PATH}" \
+  FAKE_LOG="${plan_fixture}/commands.log" \
+  FAKE_PLAN_FAILURE=true \
+  "${plan_fixture}/infra/bootstrap/scripts/migrate-state.sh" --approved >/dev/null 2>&1; then
+  echo "Migration unexpectedly accepted a failed post-migration plan." >&2
+  exit 1
+fi
+grep -Eq '^arn:aws:iam::[0-9]{12}:role/opensearch-lab-terraform-admin\|.* plan ' \
+  "${plan_fixture}/commands.log"
+cmp -s "${plan_fixture}/expected-backend.tf" "${plan_fixture}/infra/bootstrap/backend.tf"
+record_negative_case "post-migration-plan-failure-restores-backend"
 
 workspace_fixture="$(make_fixture workspace)"
 if PATH="${workspace_fixture}/bin:${PATH}" \
@@ -120,6 +210,7 @@ if PATH="${workspace_fixture}/bin:${PATH}" \
   echo "Migration unexpectedly accepted a non-default workspace." >&2
   exit 1
 fi
+record_negative_case "non-default-workspace"
 
 extra_workspace_fixture="$(make_fixture extra-workspace)"
 if PATH="${extra_workspace_fixture}/bin:${PATH}" \
@@ -129,5 +220,6 @@ if PATH="${extra_workspace_fixture}/bin:${PATH}" \
   echo "Migration unexpectedly accepted an inactive extra workspace." >&2
   exit 1
 fi
+record_negative_case "additional-workspace"
 
-echo "State migration safeguards passed."
+printf 'State migration safeguards passed (%d negative cases).\n' "${negative_case_count}"
