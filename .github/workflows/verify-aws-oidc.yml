@@ -1,0 +1,34 @@
+name: Verify AWS OIDC
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  verify:
+    name: Verify role assumption
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: aws-bootstrap
+    timeout-minutes: 5
+
+    steps:
+      - name: Obtain temporary AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          audience: sts.amazonaws.com
+          aws-region: eu-west-1
+          mask-aws-account-id: true
+          output-credentials: false
+          role-duration-seconds: 900
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          role-session-name: github-oidc-verification
+          unset-current-credentials: true
+
+      - name: Verify identity without displaying it
+        run: |
+          aws sts get-caller-identity >/dev/null
+          echo "AWS OIDC verification succeeded."

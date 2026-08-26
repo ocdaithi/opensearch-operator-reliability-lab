@@ -16,6 +16,7 @@ override.tf.json
 !*.tfvars.json.example
 .terraformrc
 terraform.rc
+/infra/bootstrap/backend.tf
 
 # Environment files
 .env

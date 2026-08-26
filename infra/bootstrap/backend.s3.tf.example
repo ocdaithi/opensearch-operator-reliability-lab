@@ -1,0 +1,9 @@
+terraform {
+  backend "s3" {
+    bucket       = "__TF_STATE_BUCKET_NAME__"
+    key          = "bootstrap/terraform.tfstate"
+    region       = "eu-west-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+}
