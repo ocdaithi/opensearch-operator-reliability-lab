@@ -1,0 +1,5 @@
+terraform {
+  backend "local" {
+    path = "../../.private/terraform-bootstrap/terraform.tfstate"
+  }
+}

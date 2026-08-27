@@ -1,0 +1,87 @@
+name: Terraform validation
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate bootstrap configuration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    env:
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_ENDPOINT_URL: http://127.0.0.1:9
+      TF_IN_AUTOMATION: "true"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check tracked repository safeguards
+        run: infra/bootstrap/tests/check-tracked-repository.sh
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.15.9
+          terraform_wrapper: false
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+
+      - name: Initialise without a backend
+        run: terraform init -backend=false -input=false
+        working-directory: infra/bootstrap
+
+      - name: Validate configuration
+        run: terraform validate -no-color
+        working-directory: infra/bootstrap
+
+      - name: Test Terraform security contracts
+        run: terraform test -no-color
+        working-directory: infra/bootstrap
+
+      - name: Test bootstrap safeguards
+        run: |
+          test_scripts=(
+            infra/bootstrap/scripts/test-*.sh
+            infra/bootstrap/tests/test-*.sh
+          )
+          printf 'Running %d safeguard scripts.\n' "${#test_scripts[@]}"
+          for test_script in "${test_scripts[@]}"; do
+            printf 'Running %s\n' "${test_script##*/}"
+            "${test_script}"
+          done
+
+      - name: Check shell scripts
+        run: |
+          shellcheck --version
+          shellcheck infra/bootstrap/scripts/*.sh infra/bootstrap/tests/*.sh
+
+      - name: Install actionlint
+        env:
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          archive="${RUNNER_TEMP}/actionlint.tar.gz"
+          install_dir="${RUNNER_TEMP}/actionlint"
+          curl --fail --location --retry 3 \
+            --output "${archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "${ACTIONLINT_SHA256}" "${archive}" | sha256sum --check --status
+          mkdir -p "${install_dir}"
+          tar -xzf "${archive}" -C "${install_dir}" actionlint
+          "${install_dir}/actionlint" -version
+
+      - name: Check GitHub Actions workflows
+        run: |
+          "${RUNNER_TEMP}/actionlint/actionlint" -color
