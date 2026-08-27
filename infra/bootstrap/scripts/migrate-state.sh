@@ -270,8 +270,7 @@ post_migration_states_match() {
         "serial",
         "lineage",
         "outputs",
-        "resources",
-        "check_results"
+        "resources"
       ])
       and .version == 4
       and (.terraform_version | is_terraform_version)
@@ -294,60 +293,42 @@ post_migration_states_match() {
         )
       );
     def has_unique_check_identities:
-      (.check_results // []) as $checks
-      | ([$checks[] | [.object_kind, .config_addr]]) as $aggregate_ids
-      | ($aggregate_ids | length) == ($aggregate_ids | unique | length)
-      and all(
-        $checks[];
-        ([((.objects // [])[]) | .object_addr]) as $object_ids
-        | ($object_ids | length) == ($object_ids | unique | length)
-      );
-    def canonical_check_results:
-      [
-        .[]
-        | {
-            object_kind: .object_kind,
-            config_addr: .config_addr,
-            status: .status,
-            objects: (
-              [
-                (.objects // [])[]
-                | {
-                    object_addr: .object_addr,
-                    status: .status,
-                    failure_messages: (.failure_messages // [])
-                  }
-              ]
-              | sort_by(.object_addr)
-            )
-          }
-      ]
-      | sort_by([.object_kind, .config_addr]);
-    def canonical_logical_state:
-      . as $state
-      | (
-          $state
-          | del(.version)
-          | del(.terraform_version)
-          | del(.serial)
-          | del(.lineage)
-          | del(.check_results)
-        )
-        + (
-          if ($state | has("check_results")) then
-            {
-              check_results: (
-                if $state.check_results == null then
-                  null
-                else
-                  ($state.check_results | canonical_check_results)
-                end
-              )
-            }
+      if (has("check_results") | not) then
+        true
+      elif .check_results == null then
+        true
+      else
+        .check_results as $checks
+        | ([$checks[] | [.object_kind, .config_addr]]) as $aggregate_ids
+        | ($aggregate_ids | length) == ($aggregate_ids | unique | length)
+        and all(
+          $checks[];
+          if (has("objects") | not) then
+            true
+          elif .objects == null then
+            true
           else
-            {}
+            ([.objects[] | .object_addr]) as $object_ids
+            | ($object_ids | length) == ($object_ids | unique | length)
           end
-        );
+        )
+      end;
+    def canonical_logical_state:
+      del(.version, .terraform_version, .serial, .lineage)
+      | if (has("check_results") and (.check_results | type == "array")) then
+          .check_results |= (
+            map(
+              if (has("objects") and (.objects | type == "array")) then
+                .objects |= sort_by(.object_addr)
+              else
+                .
+              end
+            )
+            | sort_by([.object_kind, .config_addr])
+          )
+        else
+          .
+        end;
     def post_migration_metadata_matches:
       .[0].terraform_version == .[1].terraform_version
       and (

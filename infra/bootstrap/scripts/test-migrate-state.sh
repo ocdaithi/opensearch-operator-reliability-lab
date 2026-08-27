@@ -577,6 +577,19 @@ transform_migrated_state() {
     "${filter}"
 }
 
+prepare_matching_state_shape() {
+  local fixture_root="$1"
+  local filter="$2"
+
+  transform_json_file \
+    "${fixture_root}/.private/terraform-bootstrap/terraform.tfstate" \
+    "${filter}"
+  cp "${fixture_root}/.private/terraform-bootstrap/terraform.tfstate" \
+    "${fixture_root}/expected-local-state.tfstate"
+  transform_migrated_state "${fixture_root}" "${filter}"
+  chmod 600 "${fixture_root}/expected-local-state.tfstate"
+}
+
 recovery_state_file() {
   local fixture_root="$1"
 
@@ -785,18 +798,22 @@ PATH="${object_order_fixture}/bin:${PATH}" \
   >/dev/null
 assert_remote_authoritative "${object_order_fixture}"
 
-normalised_checks_fixture="$(make_fixture normalised-empty-check-fields)"
-transform_migrated_state \
-  "${normalised_checks_fixture}" \
-  '.check_results[0].objects[0].failure_messages = []
-  | .check_results[1].objects[1] |= del(.failure_messages)
-  | .check_results[2].objects = []
-  | .check_results[3] |= del(.objects)'
-PATH="${normalised_checks_fixture}/bin:${PATH}" \
-  FAKE_LOG="${normalised_checks_fixture}/commands.log" \
-  "${normalised_checks_fixture}/infra/bootstrap/scripts/migrate-state.sh" --approved \
-  >/dev/null
-assert_remote_authoritative "${normalised_checks_fixture}"
+matching_state_shapes=(
+  'check-results-absent^del(.check_results)'
+  'check-results-null^.check_results = null'
+  'check-results-empty^.check_results = []'
+  'nested-empty^.check_results[0].objects[0].failure_messages = [] | .check_results[2].objects = []'
+)
+for matching_shape in "${matching_state_shapes[@]}"; do
+  IFS='^' read -r shape_name shape_filter <<<"${matching_shape}"
+  matching_shape_fixture="$(make_fixture "matching-${shape_name}")"
+  prepare_matching_state_shape "${matching_shape_fixture}" "${shape_filter}"
+  PATH="${matching_shape_fixture}/bin:${PATH}" \
+    FAKE_LOG="${matching_shape_fixture}/commands.log" \
+    "${matching_shape_fixture}/infra/bootstrap/scripts/migrate-state.sh" \
+    --approved >/dev/null
+  assert_remote_authoritative "${matching_shape_fixture}"
+done
 
 approval_fixture="$(make_fixture approval)"
 approval_error="${approval_fixture}/migration-error.txt"
@@ -1184,6 +1201,40 @@ assert_committed_failure \
   "${remote_pull_error}" \
   "Remote state could not be pulled after migration committed."
 record_negative_case "remote-pull-failure-keeps-s3-authoritative"
+
+structural_mismatch_cases=(
+  'check-results-absent-v-null|del(.check_results)|.check_results = null'
+  'check-results-absent-v-empty|del(.check_results)|.check_results = []'
+  'check-results-null-v-empty|.check_results = null|.check_results = []'
+  'aggregate-objects-absent-v-null|del(.check_results[2].objects)|.check_results[2].objects = null'
+  'aggregate-objects-absent-v-empty|del(.check_results[2].objects)|.check_results[2].objects = []'
+  'aggregate-objects-null-v-empty|.check_results[2].objects = null|.check_results[2].objects = []'
+  'failure-messages-absent-v-null|del(.check_results[0].objects[0].failure_messages)|.check_results[0].objects[0].failure_messages = null'
+  'failure-messages-absent-v-empty|del(.check_results[0].objects[0].failure_messages)|.check_results[0].objects[0].failure_messages = []'
+  'failure-messages-null-v-empty|.check_results[0].objects[0].failure_messages = null|.check_results[0].objects[0].failure_messages = []'
+)
+for structural_mismatch in "${structural_mismatch_cases[@]}"; do
+  IFS='|' read -r mismatch_name source_filter remote_filter \
+    <<<"${structural_mismatch}"
+  mismatch_fixture="$(make_fixture "state-${mismatch_name}")"
+  prepare_matching_state_shape "${mismatch_fixture}" "${source_filter}"
+  transform_migrated_state "${mismatch_fixture}" "${remote_filter}"
+  mismatch_error="${mismatch_fixture}/migration-error.txt"
+  if PATH="${mismatch_fixture}/bin:${PATH}" \
+    FAKE_LOG="${mismatch_fixture}/commands.log" \
+    "${mismatch_fixture}/infra/bootstrap/scripts/migrate-state.sh" --approved \
+    >/dev/null 2>"${mismatch_error}"; then
+    printf 'Migration unexpectedly accepted state structure mismatch: %s.\n' \
+      "${mismatch_name}" >&2
+    exit 1
+  fi
+  assert_committed_failure \
+    "state-${mismatch_name}-keeps-s3-authoritative" \
+    "${mismatch_fixture}" \
+    "${mismatch_error}" \
+    "Remote state differs from the recovered local state."
+  record_negative_case "state-${mismatch_name}-keeps-s3-authoritative"
+done
 
 for mismatch in \
   duplicate-aggregate \
