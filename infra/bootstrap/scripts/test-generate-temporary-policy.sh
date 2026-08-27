@@ -141,7 +141,7 @@ if ! jq -e \
     .Condition.ArnEquals["aws:PrincipalArn"]
       == ("arn:aws:iam::" + $account_id + ":user/opensearch-lab-bootstrap")
     and .Condition.ArnLike["aws:SignInSessionArn"]
-      == "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+      == ("arn:aws:signin:*:" + $account_id + ":session/*")
     and (.Condition.DateLessThan["aws:CurrentTime"] | fromdateiso8601) >= $minimum_expiry
     and (.Condition.DateLessThan["aws:CurrentTime"] | fromdateiso8601) <= $maximum_expiry;
   def common_keys:
@@ -177,6 +177,7 @@ if ! jq -e \
     and ([.. | strings | select(startswith("aws-portal:"))] | length == 0)
     and ([.. | strings | select(. == "iam:CreateServiceLinkedRole")] | length == 0)
     and ([.. | strings | select(contains("__"))] | length == 0)
+    and ([.. | strings | select(test("\\$\\{[^}]+\\}"))] | length == 0)
     and ($policy | statement("CreateAndTagExactStateBucket") |
       common_keys
       and (.Action | list) == ["s3:CreateBucket", "s3:TagResource"]
