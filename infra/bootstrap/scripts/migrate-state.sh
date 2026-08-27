@@ -2,21 +2,8 @@
 
 set -euo pipefail
 
-case "${1:-}" in
-  --approved)
-    operation="migrate"
-    ;;
-  --resume-verification)
-    operation="resume-verification"
-    ;;
-  *)
-    echo "Refusing to migrate state without the explicit --approved flag." >&2
-    exit 1
-    ;;
-esac
-
-if (($# > 2)) || [[ "${2:-}" == --* ]]; then
-  echo "Usage: migrate-state.sh <--approved|--resume-verification> [variables-file]" >&2
+if [[ "${1:-}" != "--approved" ]]; then
+  echo "Refusing to migrate state without the explicit --approved flag." >&2
   exit 1
 fi
 
@@ -43,19 +30,8 @@ lock_key="${state_key}.tflock"
 aws_profile="opensearch-lab-terraform"
 migration_lock_dir="${private_dir}/.migrate-state.lock"
 
-if [[ -L "${private_dir}" ]]; then
-  echo "The private Terraform directory must not be a symbolic link." >&2
-  exit 1
-fi
-if [[ "${operation}" == "resume-verification" ]]; then
-  if [[ ! -d "${private_dir}" ]]; then
-    echo "The private Terraform directory containing migration evidence is missing." >&2
-    exit 1
-  fi
-else
-  mkdir -p "${private_dir}"
-  chmod 700 "${private_dir}"
-fi
+mkdir -p "${private_dir}"
+chmod 700 "${private_dir}"
 umask 077
 
 if ! mkdir "${migration_lock_dir}" 2>/dev/null; then
@@ -83,18 +59,14 @@ if [[ ! -x "${backend_contract_script}" ]]; then
   exit 1
 fi
 "${backend_contract_script}" local "${local_backend_example}" >/dev/null
-
-if [[ "${operation}" == "migrate" ]]; then
-  "${backend_contract_script}" local "${backend_file}" >/dev/null
-fi
+"${backend_contract_script}" local "${backend_file}" >/dev/null
 
 if [[ ! -f "${variables_file}" ]]; then
   echo "The private Terraform variable file is missing." >&2
   exit 1
 fi
 
-if [[ "${operation}" == "migrate" ]] &&
-  [[ ! -s "${local_state_file}" || ! -f "${local_state_file}" ]]; then
+if [[ ! -s "${local_state_file}" || ! -f "${local_state_file}" ]]; then
   echo "The original local state is missing or empty." >&2
   exit 1
 fi
@@ -109,14 +81,13 @@ temporary_backend=""
 temporary_local_state_pull=""
 temporary_local_state_restore=""
 temporary_remote_state=""
-temporary_resume_remote_state=""
-retained_remote_state=""
 cached_backend_should_exist=false
 cache_may_have_been_mutated=false
 backend_recovery_ready=false
 backend_cache_recovery_ready=false
 local_state_recovery_ready=false
 migration_phase="pre-write"
+empty_destination_proven=false
 
 file_mode() {
   local file="$1"
@@ -128,14 +99,9 @@ file_mode() {
   fi
 }
 
-backend_original_mode=""
-local_state_original_mode=""
+backend_original_mode="$(file_mode "${backend_file}")"
+local_state_original_mode="$(file_mode "${local_state_file}")"
 backend_cache_original_mode=""
-
-if [[ "${operation}" == "migrate" ]]; then
-  backend_original_mode="$(file_mode "${backend_file}")"
-  local_state_original_mode="$(file_mode "${local_state_file}")"
-fi
 
 # `terraform state pull` can upgrade the state to the local CLI version:
 # https://developer.hashicorp.com/terraform/cli/commands/state/pull
@@ -165,12 +131,17 @@ states_match() {
 # comparison validates the complete v4 schema, rejects duplicate check
 # identities, and canonicalises only those two unordered arrays. All other
 # logical state remains byte-for-byte equivalent at the JSON value level.
-state_equivalence_matches() {
+post_migration_states_match() {
   local expected_state="$1"
   local actual_state="$2"
-  local metadata_contract="$3"
+  local lineage_reset_allowed=false
 
-  jq -e -s --arg metadata_contract "${metadata_contract}" '
+  if [[ "${empty_destination_proven}" == "true" &&
+    "${migration_phase}" == "committed" ]]; then
+    lineage_reset_allowed=true
+  fi
+
+  jq -e -s --argjson lineage_reset_allowed "${lineage_reset_allowed}" '
     def has_only_keys($allowed):
       ((keys - $allowed) | length) == 0;
     def has_all_keys($required):
@@ -385,16 +356,13 @@ state_equivalence_matches() {
           and .[0].serial == .[1].serial
         )
         or (
-          .[0].terraform_version == "1.15.9"
+          $lineage_reset_allowed
+          and .[0].terraform_version == "1.15.9"
           and .[1].terraform_version == "1.15.9"
           and .[0].lineage != .[1].lineage
           and .[1].serial == 1
         )
       );
-    def retained_remote_metadata_matches:
-      .[0].terraform_version == .[1].terraform_version
-      and .[0].lineage == .[1].lineage
-      and .[0].serial == .[1].serial;
 
     length == 2
     and all(.[]; valid_state)
@@ -403,24 +371,8 @@ state_equivalence_matches() {
       (.[0] | canonical_logical_state)
       == (.[1] | canonical_logical_state)
     )
-    and (
-      if $metadata_contract == "post-migration" then
-        post_migration_metadata_matches
-      elif $metadata_contract == "retained-remote" then
-        retained_remote_metadata_matches
-      else
-        false
-      end
-    )
+    and post_migration_metadata_matches
   ' "${expected_state}" "${actual_state}" >/dev/null
-}
-
-post_migration_states_match() {
-  state_equivalence_matches "$1" "$2" post-migration
-}
-
-retained_remote_state_matches() {
-  state_equivalence_matches "$1" "$2" retained-remote
 }
 
 # Print present, absent or unknown for one exact object key. A truncated listing
@@ -464,183 +416,6 @@ remote_key_status() {
   fi
 }
 
-load_active_s3_backend() {
-  if [[ ! -f "${backend_file}" || -L "${backend_file}" ]] ||
-    [[ "$(file_mode "${backend_file}")" != "600" ]]; then
-    echo "The active backend does not match the exact S3 migration contract." >&2
-    return 1
-  fi
-
-  state_bucket_name="$({
-    sed -nE \
-      's/^[[:space:]]*bucket[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' \
-      "${backend_file}"
-  })"
-  terraform_admin_role_arn="$({
-    sed -nE \
-      's/^[[:space:]]*role_arn[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' \
-      "${backend_file}"
-  })"
-
-  if [[ ! "${state_bucket_name}" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] ||
-    [[ ! "${terraform_admin_role_arn}" =~ ^arn:[a-z0-9-]+:iam::[0-9]{12}:role/opensearch-lab-terraform-admin$ ]] ||
-    ! TF_STATE_BUCKET_NAME="${state_bucket_name}" \
-      TF_ADMIN_ROLE_ARN="${terraform_admin_role_arn}" \
-      "${backend_contract_script}" s3-migration "${backend_file}" \
-      >/dev/null 2>&1; then
-    echo "The active backend does not match the exact S3 migration contract." >&2
-    return 1
-  fi
-
-  if [[ ! -s "${backend_cache_file}" || ! -f "${backend_cache_file}" ||
-    -L "${backend_cache_file}" ]] ||
-    [[ "$(file_mode "${backend_cache_file}")" != "600" ]] ||
-    ! jq -e \
-      --arg state_bucket_name "${state_bucket_name}" \
-      --arg state_key "${state_key}" \
-      --arg aws_profile "${aws_profile}" \
-      --arg terraform_admin_role_arn "${terraform_admin_role_arn}" '
-        def strip_null_members:
-          walk(
-            if type == "object" then
-              with_entries(select(.value != null))
-            else
-              .
-            end
-          );
-
-        type == "object"
-        and keys == ["backend", "terraform_version", "version"]
-        and .version == 3
-        and .terraform_version == "1.15.9"
-        and (.backend | type) == "object"
-        and (.backend | keys) == ["config", "hash", "type"]
-        and .backend.type == "s3"
-        and (.backend.hash | type == "number" and . >= 0 and floor == .)
-        and (
-          (.backend.config | strip_null_members)
-          == {
-            bucket: $state_bucket_name,
-            key: $state_key,
-            profile: $aws_profile,
-            region: "eu-west-1",
-            encrypt: true,
-            use_lockfile: true,
-            assume_role: {
-              role_arn: $terraform_admin_role_arn,
-              session_name: "terraform-bootstrap-state"
-            }
-          }
-        )
-      ' "${backend_cache_file}" >/dev/null; then
-    echo "Terraform's cached backend metadata does not match the active S3 backend." >&2
-    return 1
-  fi
-}
-
-select_latest_complete_migration_pair() {
-  local candidate_post
-  local candidate_pre
-  local candidate_name
-  local candidate_run_id
-  local candidate_timestamp
-  local candidate_pid
-  local latest_run_id=""
-  local latest_timestamp=""
-  local latest_pid=""
-
-  shopt -s nullglob
-  for candidate_post in "${private_dir}"/post-migration-*.tfstate; do
-    candidate_name="${candidate_post##*/}"
-    candidate_run_id="${candidate_name#post-migration-}"
-    candidate_run_id="${candidate_run_id%.tfstate}"
-    if [[ ! "${candidate_run_id}" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]]; then
-      continue
-    fi
-    candidate_timestamp="${candidate_run_id%-*}"
-    candidate_pid="${candidate_run_id##*-}"
-
-    candidate_pre="${private_dir}/pre-migration-${candidate_run_id}.tfstate"
-    if [[ ! -f "${candidate_pre}" || -L "${candidate_pre}" ||
-      ! -s "${candidate_pre}" || ! -f "${candidate_post}" ||
-      -L "${candidate_post}" || ! -s "${candidate_post}" ]]; then
-      continue
-    fi
-
-    if [[ -z "${latest_run_id}" ||
-      "${candidate_timestamp}" > "${latest_timestamp}" ]] ||
-      { [[ "${candidate_timestamp}" == "${latest_timestamp}" ]] &&
-        ((10#${candidate_pid} > 10#${latest_pid})); }; then
-      latest_run_id="${candidate_run_id}"
-      latest_timestamp="${candidate_timestamp}"
-      latest_pid="${candidate_pid}"
-    fi
-  done
-  shopt -u nullglob
-
-  if [[ -z "${latest_run_id}" ]]; then
-    echo "No complete retained pre/post migration state pair is available." >&2
-    return 1
-  fi
-
-  recovery_state="${private_dir}/pre-migration-${latest_run_id}.tfstate"
-  retained_remote_state="${private_dir}/post-migration-${latest_run_id}.tfstate"
-  if [[ "$(file_mode "${recovery_state}")" != "600" ||
-    "$(file_mode "${retained_remote_state}")" != "600" ]]; then
-    echo "The latest complete retained migration state pair is not mode 600." >&2
-    return 1
-  fi
-}
-
-verify_remote_plan_and_lock() {
-  local plan_status
-  local remote_lock_status
-
-  set +e
-  AWS_PROFILE="${aws_profile}" TF_VAR_terraform_admin_role_arn="${terraform_admin_role_arn}" \
-    terraform -chdir="${module_dir}" plan \
-    -detailed-exitcode \
-    -input=false \
-    -lock-timeout=60s \
-    -out="${verification_plan}" \
-    -refresh=false \
-    -var-file="${variables_file}" \
-    >/dev/null
-  plan_status=$?
-  set -e
-
-  if [[ -f "${verification_plan}" ]]; then
-    chmod 600 "${verification_plan}"
-  fi
-
-  case "${plan_status}" in
-    0)
-      ;;
-    2)
-      echo "The post-migration plan contains changes; migration verification failed." >&2
-      return 1
-      ;;
-    *)
-      echo "The post-migration plan could not complete." >&2
-      return 1
-      ;;
-  esac
-
-  remote_lock_status="$(remote_key_status "${lock_key}")"
-  case "${remote_lock_status}" in
-    absent)
-      ;;
-    present)
-      echo "The post-migration plan left a Terraform state lock object behind." >&2
-      return 1
-      ;;
-    *)
-      echo "The post-migration lock object's absence could not be established." >&2
-      return 1
-      ;;
-  esac
-}
-
 handle_failure() {
   local exit_status=$?
   local rollback_errors=0
@@ -673,16 +448,6 @@ handle_failure() {
     if ! rm -f -- "${temporary_remote_state}"; then
       echo "Could not remove the incomplete remote-state snapshot." >&2
       rollback_errors=$((rollback_errors + 1))
-    fi
-  fi
-
-  if [[ -n "${temporary_resume_remote_state}" &&
-    -e "${temporary_resume_remote_state}" ]]; then
-    if ! chmod 600 "${temporary_resume_remote_state}"; then
-      echo "Could not secure the retained resume-verification state snapshot." >&2
-      rollback_errors=$((rollback_errors + 1))
-    else
-      echo "The private resume-verification state snapshot was retained for recovery evidence." >&2
     fi
   fi
 
@@ -771,9 +536,6 @@ handle_failure() {
     committed)
       echo "Migration committed to S3, but subsequent verification failed. The S3 backend remains authoritative; local state was not reactivated and the private pre-migration recovery copy was retained." >&2
       ;;
-    resume-verification)
-      echo "Committed migration verification failed. The S3 backend remains authoritative; no migration or local-state reactivation was attempted, and the retained pre/post migration pair was preserved." >&2
-      ;;
     *)
       echo "Migration stopped in an unknown state; no automatic rollback was attempted." >&2
       rollback_errors=$((rollback_errors + 1))
@@ -795,73 +557,6 @@ handle_failure() {
 }
 
 trap handle_failure EXIT
-
-if [[ "${operation}" == "resume-verification" ]]; then
-  migration_phase="resume-verification"
-
-  if [[ "$(file_mode "${private_dir}")" != "700" ]]; then
-    echo "The private Terraform directory must be mode 700 for resume verification." >&2
-    exit 1
-  fi
-  load_active_s3_backend
-  select_latest_complete_migration_pair
-
-  if ! post_migration_states_match "${recovery_state}" "${retained_remote_state}"; then
-    echo "Retained post-migration state differs from the retained pre-migration state." >&2
-    exit 1
-  fi
-
-  current_workspace="$(
-    AWS_PROFILE="${aws_profile}" terraform -chdir="${module_dir}" workspace show
-  )"
-  workspace_names="$(
-    AWS_PROFILE="${aws_profile}" terraform -chdir="${module_dir}" workspace list |
-      sed -E 's/^[*[:space:]]+//; s/[[:space:]]+$//' |
-      sed '/^$/d'
-  )"
-  if [[ "${current_workspace}" != "default" || "${workspace_names}" != "default" ]]; then
-    echo "Committed migration verification requires default to be the only Terraform workspace." >&2
-    exit 1
-  fi
-
-  temporary_resume_remote_state="$(
-    mktemp "${private_dir}/resume-remote-state-pull.XXXXXX"
-  )"
-  if ! AWS_PROFILE="${aws_profile}" terraform -chdir="${module_dir}" state pull \
-    >"${temporary_resume_remote_state}"; then
-    echo "Current authoritative remote state could not be pulled." >&2
-    exit 1
-  fi
-  if [[ ! -s "${temporary_resume_remote_state}" ]]; then
-    echo "Current authoritative remote state pull returned an empty document." >&2
-    exit 1
-  fi
-  chmod 600 "${temporary_resume_remote_state}"
-
-  if ! retained_remote_state_matches \
-    "${retained_remote_state}" "${temporary_resume_remote_state}"; then
-    echo "Current remote state differs from the retained post-migration state." >&2
-    exit 1
-  fi
-  if ! post_migration_states_match \
-    "${recovery_state}" "${temporary_resume_remote_state}"; then
-    echo "Current remote state does not satisfy the post-migration equivalence contract." >&2
-    exit 1
-  fi
-
-  verify_remote_plan_and_lock
-
-  rm -f -- "${temporary_resume_remote_state}"
-  temporary_resume_remote_state=""
-  if ! rmdir "${migration_lock_dir}"; then
-    echo "Could not release the state-migration invocation lock." >&2
-    exit 1
-  fi
-  lock_held=false
-  trap - EXIT
-  echo "Committed migration verification passed. S3 remains authoritative and the retained recovery pair was preserved."
-  exit 0
-fi
 
 cp "${backend_file}" "${backend_recovery}"
 chmod 600 "${backend_recovery}"
@@ -975,6 +670,7 @@ if [[ "${remote_state_status}" != "absent" || "${remote_lock_status}" != "absent
   echo "The remote state destination could not be proven empty; no migration was attempted." >&2
   exit 1
 fi
+empty_destination_proven=true
 
 mv "${temporary_backend}" "${backend_file}"
 temporary_backend=""
@@ -1034,7 +730,49 @@ if ! post_migration_states_match "${recovery_state}" "${remote_state}"; then
   exit 1
 fi
 
-verify_remote_plan_and_lock
+set +e
+AWS_PROFILE="${aws_profile}" TF_VAR_terraform_admin_role_arn="${terraform_admin_role_arn}" \
+  terraform -chdir="${module_dir}" plan \
+  -detailed-exitcode \
+  -input=false \
+  -lock-timeout=60s \
+  -out="${verification_plan}" \
+  -refresh=false \
+  -var-file="${variables_file}" \
+  >/dev/null
+plan_status=$?
+set -e
+
+if [[ -f "${verification_plan}" ]]; then
+  chmod 600 "${verification_plan}"
+fi
+
+case "${plan_status}" in
+  0)
+    ;;
+  2)
+    echo "The post-migration plan contains changes; migration verification failed." >&2
+    exit 1
+    ;;
+  *)
+    echo "The post-migration plan could not complete." >&2
+    exit 1
+    ;;
+esac
+
+remote_lock_status="$(remote_key_status "${lock_key}")"
+case "${remote_lock_status}" in
+  absent)
+    ;;
+  present)
+    echo "The post-migration plan left a Terraform state lock object behind." >&2
+    exit 1
+    ;;
+  *)
+    echo "The post-migration lock object's absence could not be established." >&2
+    exit 1
+    ;;
+esac
 
 if ! rmdir "${migration_lock_dir}"; then
   echo "Could not release the state-migration invocation lock." >&2
