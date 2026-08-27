@@ -120,6 +120,35 @@ apply_terraform_mutation() {
       grep -Fq 'budget_name                   = "unsafe-budget-name"' \
         "${fixture_dir}/locals.tf"
       ;;
+    billing-view-wildcard)
+      perl -0pi -e 's#primary_billing_view_arn\s+= "[^"]+"#primary_billing_view_arn     = "*"#' \
+        "${fixture_dir}/locals.tf"
+      grep -Fq 'primary_billing_view_arn     = "*"' "${fixture_dir}/locals.tf"
+      ;;
+    billing-view-prefix-wildcard)
+      perl -0pi -e 's#primary_billing_view_arn\s+= "[^"]+"#primary_billing_view_arn     = "arn:aws:billing::\${join("", ["0000", "0000", "0000"])}:billingview/*"#' \
+        "${fixture_dir}/locals.tf"
+      grep -Fq 'primary_billing_view_arn     = "arn:aws:billing::' "${fixture_dir}/locals.tf"
+      grep -Fq '["0000", "0000", "0000"])}:billingview/*"' "${fixture_dir}/locals.tf"
+      ;;
+    billing-view-wrong-account)
+      perl -0pi -e 's#primary_billing_view_arn\s+= "[^"]+"#primary_billing_view_arn     = "arn:aws:billing::\${join("", ["0000", "0000", "0001"])}:billingview/primary"#' \
+        "${fixture_dir}/locals.tf"
+      grep -Fq 'primary_billing_view_arn     = "arn:aws:billing::' "${fixture_dir}/locals.tf"
+      grep -Fq '["0000", "0000", "0001"])}:billingview/primary"' "${fixture_dir}/locals.tf"
+      ;;
+    billing-view-wrong-partition)
+      perl -0pi -e 's#primary_billing_view_arn\s+= "[^"]+"#primary_billing_view_arn     = "arn:aws-cn:billing::\${join("", ["0000", "0000", "0000"])}:billingview/primary"#' \
+        "${fixture_dir}/locals.tf"
+      grep -Fq 'primary_billing_view_arn     = "arn:aws-cn:billing::' "${fixture_dir}/locals.tf"
+      grep -Fq '["0000", "0000", "0000"])}:billingview/primary"' "${fixture_dir}/locals.tf"
+      ;;
+    billing-view-custom-arn)
+      perl -0pi -e 's#primary_billing_view_arn\s+= "[^"]+"#primary_billing_view_arn     = "arn:aws:billing::\${join("", ["0000", "0000", "0000"])}:billingview/custom"#' \
+        "${fixture_dir}/locals.tf"
+      grep -Fq 'primary_billing_view_arn     = "arn:aws:billing::' "${fixture_dir}/locals.tf"
+      grep -Fq '["0000", "0000", "0000"])}:billingview/custom"' "${fixture_dir}/locals.tf"
+      ;;
     *)
       printf 'Unknown Terraform mutation case: %s\n' "${case_name}" >&2
       exit 1
@@ -572,6 +601,21 @@ run_terraform_negative \
 run_terraform_negative \
   wrong-budget-name \
   'The account budget must keep its exact name, account'
+run_terraform_negative \
+  billing-view-wildcard \
+  'primary billing-view ARN.'
+run_terraform_negative \
+  billing-view-prefix-wildcard \
+  'primary billing-view ARN.'
+run_terraform_negative \
+  billing-view-wrong-account \
+  'primary billing-view ARN.'
+run_terraform_negative \
+  billing-view-wrong-partition \
+  'primary billing-view ARN.'
+run_terraform_negative \
+  billing-view-custom-arn \
+  'primary billing-view ARN.'
 
 run_boundary_assignment_negative \
   replaced-human-boundary \
@@ -640,4 +684,4 @@ run_budget_destroy_guard_negative
 run_destroy_guard_decoy_negative
 run_lifecycle_filter_negative
 
-printf 'Security-contract mutations detected: %d/30.\n' "${negative_case_count}"
+printf 'Security-contract mutations detected: %d/35.\n' "${negative_case_count}"

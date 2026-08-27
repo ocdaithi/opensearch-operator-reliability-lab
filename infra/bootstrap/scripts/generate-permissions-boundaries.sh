@@ -6,7 +6,7 @@ if (($# != 0)); then
   exit 1
 fi
 
-for command_name in git jq mktemp; do
+for command_name in git jq link mktemp; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "Required command is unavailable: ${command_name}" >&2
     exit 1
@@ -24,9 +24,13 @@ repository_root="$(git -C "${script_dir}" rev-parse --show-toplevel)"
 contract_digest_script="${script_dir}/policy-contract-digest.sh"
 policy_dir="${repository_root}/infra/bootstrap/policies"
 private_dir="${repository_root}/.private/terraform-bootstrap"
+human_destination="${private_dir}/terraform-admin-boundary.json"
+github_destination="${private_dir}/github-actions-boundary.json"
+lock_directory="${private_dir}/.generate-permissions-boundaries.lock"
 partition="aws"
 state_bucket_name="opensearch-lab-tfstate-ocdaithi-1346323330-eu-west-1"
-human_template_digest="ad115920994021f6d73f337c1744223458279a282f53ed9d6e516e85c65a040d"
+billing_view_arn="arn:${partition}:billing::${account_id}:billingview/primary"
+human_template_digest="c8592acc57fea897687b8b9b12cba677d9411f47b5c92280c3576f57846ff906"
 github_template_digest="21a1c3d24734eceb43fa2b0dd69f0748a89e480b5e20fcb41dd04ffa72e6f8b7"
 
 if [[ ! -x "${contract_digest_script}" ]]; then
@@ -45,9 +49,61 @@ mkdir -p "${private_dir}"
 chmod 700 "${private_dir}"
 umask 077
 
-human_temporary="$(mktemp "${private_dir}/terraform-admin-boundary.json.XXXXXX")"
-github_temporary="$(mktemp "${private_dir}/github-actions-boundary.json.XXXXXX")"
-trap 'rm -f -- "${human_temporary}" "${github_temporary}"' EXIT
+human_temporary=""
+github_temporary=""
+lock_owned=false
+
+cleanup() {
+  local exit_status="$?"
+
+  trap - EXIT HUP INT TERM
+
+  if [[ -n "${human_temporary}" ]]; then
+    rm -f -- "${human_temporary}"
+  fi
+  if [[ -n "${github_temporary}" ]]; then
+    rm -f -- "${github_temporary}"
+  fi
+  if [[ "${lock_owned}" == true ]]; then
+    rmdir "${lock_directory}" >/dev/null 2>&1 || true
+  fi
+
+  exit "${exit_status}"
+}
+
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+if ! mkdir "${lock_directory}" 2>/dev/null; then
+  echo "Another permissions-boundary generation is active or its lock remains." >&2
+  exit 1
+fi
+lock_owned=true
+
+destination_must_not_exist() {
+  local destination="$1"
+
+  if [[ -e "${destination}" || -L "${destination}" ]]; then
+    echo "Refusing to overwrite existing destination: ${destination}" >&2
+    return 1
+  fi
+}
+
+publish_exclusively() {
+  local staged_file="$1"
+  local destination="$2"
+
+  if ! link "${staged_file}" "${destination}" 2>/dev/null; then
+    echo "Could not publish without overwriting destination: ${destination}" >&2
+    return 1
+  fi
+}
+
+destination_must_not_exist "${human_destination}"
+destination_must_not_exist "${github_destination}"
+
+human_temporary="$(mktemp "${private_dir}/.terraform-admin-boundary.json.XXXXXX")"
+github_temporary="$(mktemp "${private_dir}/.github-actions-boundary.json.XXXXXX")"
 
 resolve_template() {
   local template_file="$1"
@@ -130,8 +186,20 @@ for resolved_file in "${human_temporary}" "${github_temporary}"; do
   chmod 600 "${resolved_file}"
 done
 
-mv "${human_temporary}" "${private_dir}/terraform-admin-boundary.json"
-mv "${github_temporary}" "${private_dir}/github-actions-boundary.json"
-trap - EXIT
+if ! jq -e --arg billing_view_arn "${billing_view_arn}" '
+  [.Statement[] | select(.Sid == "ReadDefaultBillingViewData")]
+  | length == 1
+    and .[0].Action == "billing:GetBillingViewData"
+    and .[0].Resource == $billing_view_arn
+' "${human_temporary}" >/dev/null; then
+  echo "The Terraform administration boundary failed its billing-view invariant." >&2
+  exit 1
+fi
+
+destination_must_not_exist "${human_destination}"
+destination_must_not_exist "${github_destination}"
+
+publish_exclusively "${human_temporary}" "${human_destination}"
+publish_exclusively "${github_temporary}" "${github_destination}"
 
 echo "Permissions boundaries generated in the private bootstrap directory."
