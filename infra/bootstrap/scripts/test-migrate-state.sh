@@ -207,12 +207,16 @@ set -euo pipefail
 printf 'unset|%s\n' "$*" >>"${FAKE_LOG}"
 fixture_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 object_key=""
+no_paginate=false
 
 while (($# > 0)); do
   case "$1" in
     --prefix)
       shift
       object_key="${1:-}"
+      ;;
+    --no-paginate)
+      no_paginate=true
       ;;
   esac
   shift || true
@@ -221,6 +225,12 @@ done
 if [[ -z "${object_key}" ]]; then
   printf 'Unexpected fake AWS command without an exact prefix.\n' >&2
   exit 98
+fi
+
+if [[ "${no_paginate}" != "true" ]]; then
+  jq -cn --arg object_key "${object_key}" \
+    '{Prefix:$object_key,RequestCharged:null}'
+  exit 0
 fi
 
 if [[ -e "${fixture_root}/migration-attempted" &&
@@ -244,11 +254,35 @@ case "${object_key}" in
     ;;
 esac
 
+case "${FAKE_LIST_RESPONSE_MODE:-normal}" in
+  truncated-without-exact-key)
+    jq -cn --arg object_key "${object_key}" \
+      '{IsTruncated:true,KeyCount:1,Contents:[{Key:($object_key + ".other")}]}'
+    exit 0
+    ;;
+  key-count-inconsistent)
+    jq -cn --arg object_key "${object_key}" \
+      '{IsTruncated:false,KeyCount:0,Contents:[{Key:$object_key}]}'
+    exit 0
+    ;;
+  contents-null)
+    printf '%s\n' '{"IsTruncated":false,"KeyCount":0,"Contents":null}'
+    exit 0
+    ;;
+  normal)
+    ;;
+  *)
+    printf 'Unknown fake list response mode: %s\n' \
+      "${FAKE_LIST_RESPONSE_MODE}" >&2
+    exit 99
+    ;;
+esac
+
 if [[ -e "${object_file}" ]]; then
   jq -cn --arg object_key "${object_key}" \
     '{IsTruncated:false,KeyCount:1,Contents:[{Key:$object_key}]}'
 else
-  printf '%s\n' '{"IsTruncated":false,"KeyCount":0,"Contents":[]}'
+  printf '%s\n' '{"IsTruncated":false,"KeyCount":0}'
 fi
 EOF
 
@@ -445,8 +479,10 @@ grep -Fq 'profile      = "opensearch-lab-terraform"' \
 grep -Eq '^arn:aws:iam::[0-9]{12}:role/opensearch-lab-terraform-admin\|.* plan ' \
   "${success_log}"
 grep -Fq -- '-detailed-exitcode' "${success_log}"
-grep -Fq -- '--prefix bootstrap/terraform.tfstate --output json' "${success_log}"
-grep -Fq -- '--prefix bootstrap/terraform.tfstate.tflock --output json' "${success_log}"
+grep -Fq -- '--prefix bootstrap/terraform.tfstate --no-paginate --output json' \
+  "${success_log}"
+grep -Fq -- '--prefix bootstrap/terraform.tfstate.tflock --no-paginate --output json' \
+  "${success_log}"
 
 approval_fixture="$(make_fixture approval)"
 approval_error="${approval_fixture}/migration-error.txt"
@@ -626,6 +662,35 @@ assert_expected_failure_output \
 assert_local_backend_restored "${precheck_unknown_fixture}"
 record_negative_case "destination-absence-unknown"
 
+for response_mode in \
+  truncated-without-exact-key \
+  key-count-inconsistent \
+  contents-null; do
+  response_fixture="$(make_fixture "destination-${response_mode}")"
+  response_error="${response_fixture}/migration-error.txt"
+  if PATH="${response_fixture}/bin:${PATH}" \
+    FAKE_LOG="${response_fixture}/commands.log" \
+    FAKE_LIST_RESPONSE_MODE="${response_mode}" \
+    "${response_fixture}/infra/bootstrap/scripts/migrate-state.sh" --approved \
+    >/dev/null 2>"${response_error}"; then
+    printf 'Migration unexpectedly accepted list response mode: %s.\n' \
+      "${response_mode}" >&2
+    exit 1
+  fi
+  assert_expected_failure_output \
+    "destination-${response_mode}" \
+    "${response_error}" \
+    "The remote state destination could not be proven empty; no migration was attempted."
+  assert_local_backend_restored "${response_fixture}"
+  test ! -e "${response_fixture}/migration-attempted"
+  if grep -Fq ' init -migrate-state ' "${response_fixture}/commands.log"; then
+    printf 'Migration init ran for list response mode: %s.\n' \
+      "${response_mode}" >&2
+    exit 1
+  fi
+  record_negative_case "destination-${response_mode}"
+done
+
 init_empty_fixture="$(make_fixture init-failure-empty)"
 init_empty_error="${init_empty_fixture}/migration-error.txt"
 if PATH="${init_empty_fixture}/bin:${PATH}" \
@@ -642,9 +707,9 @@ assert_expected_failure_output \
   "both exact remote keys are absent; safe rollback is permitted."
 assert_local_backend_restored "${init_empty_fixture}"
 test ! -e "${init_empty_fixture}/remote-store/bootstrap/terraform.tfstate"
-test "$(grep -Fc -- '--prefix bootstrap/terraform.tfstate --output json' \
+test "$(grep -Fc -- '--prefix bootstrap/terraform.tfstate --no-paginate --output json' \
   "${init_empty_fixture}/commands.log")" -eq 2
-test "$(grep -Fc -- '--prefix bootstrap/terraform.tfstate.tflock --output json' \
+test "$(grep -Fc -- '--prefix bootstrap/terraform.tfstate.tflock --no-paginate --output json' \
   "${init_empty_fixture}/commands.log")" -eq 2
 record_negative_case "init-failure-with-empty-remote-rolls-back"
 
@@ -722,9 +787,9 @@ assert_expected_failure_output \
 assert_s3_backend_preserved "${interrupted_init_fixture}"
 cmp -s "${interrupted_init_fixture}/expected-local-state.tfstate" \
   "${interrupted_init_fixture}/.private/terraform-bootstrap/terraform.tfstate"
-test "$(grep -Fc -- '--prefix bootstrap/terraform.tfstate --output json' \
+test "$(grep -Fc -- '--prefix bootstrap/terraform.tfstate --no-paginate --output json' \
   "${interrupted_init_fixture}/commands.log")" -eq 2
-test "$(grep -Fc -- '--prefix bootstrap/terraform.tfstate.tflock --output json' \
+test "$(grep -Fc -- '--prefix bootstrap/terraform.tfstate.tflock --no-paginate --output json' \
   "${interrupted_init_fixture}/commands.log")" -eq 2
 record_negative_case "interruption-after-init-starts-fails-closed"
 

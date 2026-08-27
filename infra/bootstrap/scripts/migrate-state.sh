@@ -136,6 +136,7 @@ remote_key_status() {
       --profile "${aws_profile}" \
       --bucket "${state_bucket_name}" \
       --prefix "${object_key}" \
+      --no-paginate \
       --output json 2>/dev/null
   )"; then
     printf 'unknown\n'
@@ -145,9 +146,10 @@ remote_key_status() {
   if ! jq -e '
     type == "object"
     and (.IsTruncated | type == "boolean")
-    and (.KeyCount | type == "number" and . >= 0)
-    and ((.Contents // []) | type == "array")
-    and all(.Contents[]?; (.Key | type == "string"))
+    and (.KeyCount | type == "number" and . >= 0 and floor == .)
+    and ((has("Contents") | not) or (.Contents | type == "array"))
+    and all(.Contents[]?; type == "object" and (.Key | type == "string"))
+    and (.KeyCount == ((.Contents // []) | length))
   ' >/dev/null <<<"${listing}"; then
     printf 'unknown\n'
     return
