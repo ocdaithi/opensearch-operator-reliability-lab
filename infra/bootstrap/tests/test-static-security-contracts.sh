@@ -2,6 +2,7 @@
 set -euo pipefail
 
 bootstrap_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+budget_file="$bootstrap_dir/budget.tf"
 state_file="$bootstrap_dir/state.tf"
 structure_inspector="$bootstrap_dir/tests/inspect-hcl-structure.py"
 shopt -s nullglob
@@ -248,8 +249,9 @@ if ! has_exact_boundary \
 fi
 
 has_prevent_destroy() {
-  local resource_type="$1"
-  local resource_name="$2"
+  local configuration_file="$1"
+  local resource_type="$2"
+  local resource_name="$3"
 
   awk -v expected_type="$resource_type" -v expected_name="$resource_name" '
     /^[[:space:]]*resource[[:space:]]+"[^"]+"[[:space:]]+"[^"]+"[[:space:]]*\{[[:space:]]*$/ {
@@ -325,8 +327,16 @@ has_prevent_destroy() {
     END {
       exit !(seen && lifecycle_blocks == 1 && prevent_assignments == 1 && protected)
     }
-  ' "$state_file"
+  ' "$configuration_file"
 }
+
+if ! has_prevent_destroy \
+  "$budget_file" \
+  aws_budgets_budget \
+  account_cost; then
+  printf 'Missing prevent_destroy on aws_budgets_budget.account_cost.\n' >&2
+  exit 1
+fi
 
 protected_resources=(
   aws_s3_bucket.state
@@ -341,10 +351,10 @@ protected_resources=(
 for resource in "${protected_resources[@]}"; do
   resource_type="${resource%%.*}"
   resource_name="${resource#*.}"
-  if ! has_prevent_destroy "$resource_type" "$resource_name"; then
+  if ! has_prevent_destroy "$state_file" "$resource_type" "$resource_name"; then
     printf 'Missing prevent_destroy on %s.\n' "$resource" >&2
     exit 1
   fi
 done
 
-printf 'Static bootstrap contracts passed: 13 allowed resources, 2 exact role boundaries, 1 exact budget source, 1 all-object lifecycle filter, 0 modules, 0 provisioners, 0 ignore_changes rules, 7 destroy guards.\n'
+printf 'Static bootstrap contracts passed: 13 allowed resources, 2 exact role boundaries, 1 exact budget source, 1 all-object lifecycle filter, 0 modules, 0 provisioners, 0 ignore_changes rules, 8 destroy guards.\n'

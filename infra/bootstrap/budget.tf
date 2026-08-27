@@ -7,6 +7,10 @@ resource "aws_budgets_budget" "account_cost" {
   time_unit    = "MONTHLY"
   metrics      = ["UnblendedCost"]
 
+  lifecycle {
+    prevent_destroy = true
+  }
+
   filter_expression {
     not {
       dimensions {

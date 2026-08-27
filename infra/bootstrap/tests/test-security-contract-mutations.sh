@@ -456,6 +456,37 @@ run_indented_runtime_resource_negative() {
   record_case "${case_name}"
 }
 
+run_budget_destroy_guard_negative() {
+  local case_name="missing-budget-destroy-guard"
+  local fixture_dir="${mutation_root}/${case_name}/infra/bootstrap"
+  local test_log="${mutation_root}/${case_name}.log"
+
+  copy_static_fixture "${fixture_dir}"
+  perl -0pi -e 's/  lifecycle \{\n    prevent_destroy = true\n  \}\n//' \
+    "${fixture_dir}/budget.tf"
+  if grep -Fq 'prevent_destroy = true' "${fixture_dir}/budget.tf"; then
+    printf 'FAIL %s: the budget destroy guard mutation was not applied.\n' \
+      "${case_name}" >&2
+    exit 1
+  fi
+  assert_mutated_hcl_parses "${case_name}" "${fixture_dir}"
+
+  if "${fixture_dir}/tests/test-static-security-contracts.sh" >"${test_log}" 2>&1; then
+    printf 'FAIL %s: the static contract accepted an unprotected budget.\n' \
+      "${case_name}" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'Missing prevent_destroy on aws_budgets_budget.account_cost.' \
+    "${test_log}"; then
+    printf 'FAIL %s: static test did not report the missing budget guard.\n' \
+      "${case_name}" >&2
+    cat "${test_log}" >&2
+    exit 1
+  fi
+
+  record_case "${case_name}"
+}
+
 run_destroy_guard_decoy_negative() {
   local case_name="destroy-guard-heredoc-decoy"
   local fixture_dir="${mutation_root}/${case_name}/infra/bootstrap"
@@ -605,7 +636,8 @@ run_structural_static_negative \
 run_structural_static_negative \
   future-budget-start \
   'The account budget must omit optional activation, billing-view and adjustment settings.'
+run_budget_destroy_guard_negative
 run_destroy_guard_decoy_negative
 run_lifecycle_filter_negative
 
-printf 'Security-contract mutations detected: %d/29.\n' "${negative_case_count}"
+printf 'Security-contract mutations detected: %d/30.\n' "${negative_case_count}"
