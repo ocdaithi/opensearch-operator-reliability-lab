@@ -87,6 +87,7 @@ backend_recovery_ready=false
 backend_cache_recovery_ready=false
 local_state_recovery_ready=false
 migration_phase="pre-write"
+empty_destination_proven=false
 
 file_mode() {
   local file="$1"
@@ -122,6 +123,236 @@ states_match() {
     and .[0].lineage == .[1].lineage
     and .[0].serial == .[1].serial
     and (.[0] | del(.terraform_version)) == (.[1] | del(.terraform_version))
+  ' "${expected_state}" "${actual_state}" >/dev/null
+}
+
+# Terraform 1.15.9 stores check aggregates and their objects in address maps,
+# whose iteration order is not stable when a state is serialised. This
+# comparison validates the complete v4 schema, rejects duplicate check
+# identities, and canonicalises only those two unordered arrays. All other
+# logical state remains byte-for-byte equivalent at the JSON value level.
+post_migration_states_match() {
+  local expected_state="$1"
+  local actual_state="$2"
+  local lineage_reset_allowed=false
+
+  if [[ "${empty_destination_proven}" == "true" &&
+    "${migration_phase}" == "committed" ]]; then
+    lineage_reset_allowed=true
+  fi
+
+  jq -e -s --argjson lineage_reset_allowed "${lineage_reset_allowed}" '
+    def has_only_keys($allowed):
+      ((keys - $allowed) | length) == 0;
+    def has_all_keys($required):
+      (($required - keys) | length) == 0;
+    def is_unsigned_integer:
+      type == "number" and . >= 0 and floor == .;
+    def is_terraform_version:
+      type == "string"
+      and test("^[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.+-]+)?$");
+    def is_check_status:
+      type == "string" and IN("pass", "fail", "error", "unknown");
+    def valid_output:
+      type == "object"
+      and has_only_keys(["value", "type", "sensitive"])
+      and has_all_keys(["value", "type"])
+      and ((.type | type) == "string" or (.type | type) == "array")
+      and ((has("sensitive") | not) or (.sensitive | type) == "boolean");
+    def valid_instance:
+      type == "object"
+      and has_only_keys([
+        "index_key",
+        "status",
+        "deposed",
+        "schema_version",
+        "attributes",
+        "attributes_flat",
+        "sensitive_attributes",
+        "identity_schema_version",
+        "identity",
+        "private",
+        "dependencies",
+        "create_before_destroy"
+      ])
+      and has_all_keys(["schema_version", "identity_schema_version"])
+      and (.schema_version | is_unsigned_integer)
+      and (.identity_schema_version | is_unsigned_integer)
+      and (
+        (has("index_key") | not)
+        or (.index_key | type) == "string"
+        or (.index_key | is_unsigned_integer)
+      )
+      and (
+        (has("status") | not)
+        or (.status | type == "string" and IN("", "tainted"))
+      )
+      and (
+        (has("deposed") | not)
+        or (.deposed | type == "string" and (length == 0 or length == 8))
+      )
+      and (
+        (has("attributes_flat") | not)
+        or (
+          (.attributes_flat | type) == "object"
+          and all(.attributes_flat[]; type == "string")
+        )
+      )
+      and (
+        (has("sensitive_attributes") | not)
+        or (.sensitive_attributes | type) == "array"
+      )
+      and ((has("private") | not) or (.private | type) == "string")
+      and (
+        (has("dependencies") | not)
+        or (
+          (.dependencies | type) == "array"
+          and all(.dependencies[]; type == "string")
+        )
+      )
+      and (
+        (has("create_before_destroy") | not)
+        or (.create_before_destroy | type) == "boolean"
+      );
+    def valid_resource:
+      type == "object"
+      and has_only_keys([
+        "module", "mode", "type", "name", "each", "provider", "instances"
+      ])
+      and has_all_keys(["mode", "type", "name", "provider", "instances"])
+      and (.mode | type == "string" and IN("managed", "data"))
+      and (.type | type == "string" and length > 0)
+      and (.name | type == "string" and length > 0)
+      and (.provider | type == "string" and length > 0)
+      and ((has("module") | not) or (.module | type) == "string")
+      and ((has("each") | not) or (.each | type) == "string")
+      and (.instances | type == "array" and all(.[]; valid_instance));
+    def valid_check_object:
+      type == "object"
+      and has_only_keys(["object_addr", "status", "failure_messages"])
+      and has_all_keys(["object_addr", "status"])
+      and (.object_addr | type == "string" and length > 0)
+      and (.status | is_check_status)
+      and (
+        (has("failure_messages") | not)
+        or .failure_messages == null
+        or (
+          (.failure_messages | type) == "array"
+          and all(.failure_messages[]; type == "string")
+        )
+      );
+    def valid_check_aggregate:
+      type == "object"
+      and has_only_keys(["object_kind", "config_addr", "status", "objects"])
+      and has_all_keys(["object_kind", "config_addr", "status"])
+      and (.object_kind | type == "string" and IN("resource", "output", "check", "var"))
+      and (.config_addr | type == "string" and length > 0)
+      and (.status | is_check_status)
+      and (
+        (has("objects") | not)
+        or .objects == null
+        or ((.objects | type) == "array" and all(.objects[]; valid_check_object))
+      );
+    def valid_state:
+      type == "object"
+      and has_only_keys([
+        "version",
+        "terraform_version",
+        "serial",
+        "lineage",
+        "outputs",
+        "resources",
+        "check_results"
+      ])
+      and has_all_keys([
+        "version",
+        "terraform_version",
+        "serial",
+        "lineage",
+        "outputs",
+        "resources"
+      ])
+      and .version == 4
+      and (.terraform_version | is_terraform_version)
+      and (.serial | is_unsigned_integer)
+      and (.lineage | type == "string" and length > 0)
+      and (
+        (.outputs | type) == "object"
+        and all(.outputs[]; valid_output)
+      )
+      and (
+        (.resources | type) == "array"
+        and all(.resources[]; valid_resource)
+      )
+      and (
+        (has("check_results") | not)
+        or .check_results == null
+        or (
+          (.check_results | type) == "array"
+          and all(.check_results[]; valid_check_aggregate)
+        )
+      );
+    def has_unique_check_identities:
+      if (has("check_results") | not) then
+        true
+      elif .check_results == null then
+        true
+      else
+        .check_results as $checks
+        | ([$checks[] | [.object_kind, .config_addr]]) as $aggregate_ids
+        | ($aggregate_ids | length) == ($aggregate_ids | unique | length)
+        and all(
+          $checks[];
+          if (has("objects") | not) then
+            true
+          elif .objects == null then
+            true
+          else
+            ([.objects[] | .object_addr]) as $object_ids
+            | ($object_ids | length) == ($object_ids | unique | length)
+          end
+        )
+      end;
+    def canonical_logical_state:
+      del(.version, .terraform_version, .serial, .lineage)
+      | if (has("check_results") and (.check_results | type == "array")) then
+          .check_results |= (
+            map(
+              if (has("objects") and (.objects | type == "array")) then
+                .objects |= sort_by(.object_addr)
+              else
+                .
+              end
+            )
+            | sort_by([.object_kind, .config_addr])
+          )
+        else
+          .
+        end;
+    def post_migration_metadata_matches:
+      .[0].terraform_version == .[1].terraform_version
+      and (
+        (
+          .[0].lineage == .[1].lineage
+          and .[0].serial == .[1].serial
+        )
+        or (
+          $lineage_reset_allowed
+          and .[0].terraform_version == "1.15.9"
+          and .[1].terraform_version == "1.15.9"
+          and .[0].lineage != .[1].lineage
+          and .[1].serial == 1
+        )
+      );
+
+    length == 2
+    and all(.[]; valid_state)
+    and all(.[]; has_unique_check_identities)
+    and (
+      (.[0] | canonical_logical_state)
+      == (.[1] | canonical_logical_state)
+    )
+    and post_migration_metadata_matches
   ' "${expected_state}" "${actual_state}" >/dev/null
 }
 
@@ -420,6 +651,7 @@ if [[ "${remote_state_status}" != "absent" || "${remote_lock_status}" != "absent
   echo "The remote state destination could not be proven empty; no migration was attempted." >&2
   exit 1
 fi
+empty_destination_proven=true
 
 mv "${temporary_backend}" "${backend_file}"
 temporary_backend=""
@@ -474,7 +706,7 @@ chmod 600 "${temporary_remote_state}"
 mv "${temporary_remote_state}" "${remote_state}"
 temporary_remote_state=""
 
-if ! states_match "${recovery_state}" "${remote_state}"; then
+if ! post_migration_states_match "${recovery_state}" "${remote_state}"; then
   echo "Remote state differs from the recovered local state." >&2
   exit 1
 fi

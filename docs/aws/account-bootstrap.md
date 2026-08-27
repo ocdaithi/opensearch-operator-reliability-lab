@@ -356,9 +356,15 @@ Do not run `render-s3-backend.sh` during this migration flow and do not run `ter
 "${module_dir}/scripts/migrate-state.sh" --approved
 ```
 
-Stop on any error and follow the script's phase-specific diagnostic. If it reports a partial, indeterminate or committed migration, do not restore local state, delete remote objects, force-unlock, replace `backend.tf` or retry. On success, S3 is authoritative and the private pre-migration recovery copy remains for controlled recovery.
+Stop on any error and follow the script's phase-specific diagnostic. If it reports a partial or indeterminate migration, do not restore local state, delete remote objects, force-unlock, replace `backend.tf` or retry. If it reports a committed migration, S3 is authoritative: follow the recovery procedure below and never rerun `migrate-state.sh --approved` or `terraform init -migrate-state`. On success, S3 is authoritative and the private pre-migration recovery copy remains for controlled recovery.
 
 The migration keeps its mode-600 recovery and verification files under `.private/terraform-bootstrap/`: `pre-migration-*.tfstate`, `post-migration-*.tfstate`, `pre-migration-backend-*.tf`, an optional `pre-migration-backend-cache-*.tfstate` and `post-migration-lock-check.tfplan`. Never stage, paste or publish these files, the resolved policies, `terraform.tfvars`, `terraform.tfstate`, `infra/bootstrap/backend.tf`, the repository-local `.aws/` directory or the AWS CLI role cache at `~/.aws/cli/cache`.
+
+#### Manual recovery after a committed migration
+
+If the S3 write committed but post-migration verification failed, stop and treat S3 as authoritative. Retain the backend configuration, cached backend metadata and all recovery evidence unchanged. The recovery must be designed and reviewed for the specific failure before any state or backend operation is run.
+
+Never rerun `migrate-state.sh --approved` or `terraform init -migrate-state` after the S3 write commits. Do not reactivate local state, push state, delete remote objects, force-unlock or replace `backend.tf` as an attempted recovery. Continue with step 9 only after the reviewed recovery has established that the committed remote state is sound and post-migration verification has completed successfully.
 
 ### 9. Verify before removing temporary access
 
