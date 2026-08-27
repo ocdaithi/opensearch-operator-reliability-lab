@@ -56,6 +56,23 @@ EOF
 AWS_ACCOUNT_ID="${account_id}" \
   "${fixture_root}/infra/bootstrap/scripts/generate-permissions-boundaries.sh" >/dev/null
 
+if ! jq -e --arg account_id "${account_id}" '
+  def statement($sid):
+    [.Statement[] | select(.Sid == $sid)]
+    | if length == 1 then .[0] else null end;
+  . as $policy
+  | ($policy.Statement | length) == 11
+    and all($policy.Statement[]; .Sid != "ListExactTerraformStateKeys")
+    and ($policy | statement("ReadDefaultBillingViewData") |
+      .Action == "billing:GetBillingViewData"
+      and .Resource
+        == ("arn:aws:billing::" + $account_id + ":billingview/primary"))
+' "${fixture_root}/.private/terraform-bootstrap/terraform-admin-boundary.json" \
+  >/dev/null; then
+  echo 'The verifier fixture human boundary lacks its reviewed static contract.' >&2
+  exit 1
+fi
+
 jq -n \
   --arg account_id "${account_id}" \
   --arg state_bucket_name "${state_bucket_name}" \
@@ -769,6 +786,34 @@ chmod 700 "${fixture_root}/bin/aws" "${fixture_root}/bin/terraform"
 AWS_ACCOUNT_ID="${account_id}" \
   "${fixture_root}/infra/bootstrap/scripts/generate-temporary-policy.sh" >/dev/null
 
+if ! jq -e --arg account_id "${account_id}" '
+  def statement($sid):
+    [.Statement[] | select(.Sid == $sid)]
+    | if length == 1 then .[0] else null end;
+  . as $policy
+  | [.Statement[] | select(.Effect == "Allow")] as $allows
+  | ($policy.Statement | length) == 11
+    and ($allows | length) == 11
+    and all($policy.Statement[]; .Sid != "ListExactTerraformStateKeys")
+    and all($allows[];
+      .Condition.ArnEquals["aws:PrincipalArn"]
+        == ("arn:aws:iam::" + $account_id + ":user/opensearch-lab-bootstrap")
+      and .Condition.ArnLike["aws:SignInSessionArn"]
+        == "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+      and (.Condition.DateLessThan["aws:CurrentTime"] |
+        type == "string"
+        and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+    )
+    and ($policy | statement("ReadDefaultBillingViewData") |
+      .Action == "billing:GetBillingViewData"
+      and .Resource
+        == ("arn:aws:billing::" + $account_id + ":billingview/primary"))
+' "${fixture_root}/.private/terraform-bootstrap/temporary-bootstrap-policy.json" \
+  >/dev/null; then
+  echo 'The verifier fixture temporary policy lacks its reviewed static contract.' >&2
+  exit 1
+fi
+
 run_verification() {
   phase="$1"
   scenario="${2:-}"
@@ -878,7 +923,8 @@ expected_verification_diagnostic() {
     stale-resolved-boundary)
       printf '%s\n' 'A resolved private permissions boundary is stale or differs from its tracked template.'
       ;;
-    stale-resolved-temporary-policy)
+    stale-resolved-temporary-billing | stale-resolved-temporary-expiry | \
+      stale-resolved-temporary-principal | stale-resolved-temporary-sign-in)
       printf '%s\n' 'The resolved private temporary policy is stale, expired or differs from its tracked template.'
       ;;
     changed-role-inline-policy)
@@ -987,11 +1033,16 @@ human_boundary_file="${fixture_root}/.private/terraform-bootstrap/terraform-admi
 human_boundary_recovery="${test_root}/terraform-admin-boundary.reviewed.json"
 human_boundary_mutation="${test_root}/terraform-admin-boundary.mutated.json"
 cp "${human_boundary_file}" "${human_boundary_recovery}"
-jq '(.Statement[] | select(.Sid == "ManageStateBucketControls") | .Action) += ["s3:DeleteBucket"]' \
+jq --arg account_id "${account_id}" '
+  (.Statement[] | select(.Sid == "ReadDefaultBillingViewData") | .Resource)
+    = ("arn:aws:billing::" + $account_id + ":billingview/custom")
+' \
   "${human_boundary_file}" >"${human_boundary_mutation}"
 mv "${human_boundary_mutation}" "${human_boundary_file}"
 chmod 600 "${human_boundary_file}"
-jq -e 'any(.Statement[]; .Sid == "ManageStateBucketControls" and (.Action | index("s3:DeleteBucket") != null))' \
+jq -e 'any(.Statement[];
+  .Sid == "ReadDefaultBillingViewData"
+  and (.Resource | endswith(":billingview/custom")))' \
   "${human_boundary_file}" >/dev/null
 expect_verification_failure before stale-resolved-boundary
 mv "${human_boundary_recovery}" "${human_boundary_file}"
@@ -1000,13 +1051,41 @@ temporary_policy_file="${fixture_root}/.private/terraform-bootstrap/temporary-bo
 temporary_policy_recovery="${test_root}/temporary-bootstrap-policy.reviewed.json"
 temporary_policy_mutation="${test_root}/temporary-bootstrap-policy.mutated.json"
 cp "${temporary_policy_file}" "${temporary_policy_recovery}"
-jq '(.Statement[] | select(.Sid == "ReadExactBootstrapUser") | .Action) = ["iam:GetUser", "iam:GetUserPolicy"]' \
+jq 'del(.Statement[0].Condition.ArnEquals["aws:PrincipalArn"])' \
   "${temporary_policy_file}" >"${temporary_policy_mutation}"
 mv "${temporary_policy_mutation}" "${temporary_policy_file}"
 chmod 600 "${temporary_policy_file}"
-jq -e 'any(.Statement[]; .Sid == "ReadExactBootstrapUser" and (.Action | index("iam:GetUserPolicy") != null))' \
+jq -e '.Statement[0].Condition.ArnEquals | has("aws:PrincipalArn") | not' \
   "${temporary_policy_file}" >/dev/null
-expect_verification_failure before stale-resolved-temporary-policy
+expect_verification_failure before stale-resolved-temporary-principal
+cp "${temporary_policy_recovery}" "${temporary_policy_file}"
+
+jq 'del(.Statement[0].Condition.ArnLike["aws:SignInSessionArn"])' \
+  "${temporary_policy_file}" >"${temporary_policy_mutation}"
+mv "${temporary_policy_mutation}" "${temporary_policy_file}"
+chmod 600 "${temporary_policy_file}"
+jq -e '.Statement[0].Condition.ArnLike | has("aws:SignInSessionArn") | not' \
+  "${temporary_policy_file}" >/dev/null
+expect_verification_failure before stale-resolved-temporary-sign-in
+cp "${temporary_policy_recovery}" "${temporary_policy_file}"
+
+jq 'del(.Statement[0].Condition.DateLessThan["aws:CurrentTime"])' \
+  "${temporary_policy_file}" >"${temporary_policy_mutation}"
+mv "${temporary_policy_mutation}" "${temporary_policy_file}"
+chmod 600 "${temporary_policy_file}"
+jq -e '.Statement[0].Condition.DateLessThan | has("aws:CurrentTime") | not' \
+  "${temporary_policy_file}" >/dev/null
+expect_verification_failure before stale-resolved-temporary-expiry
+cp "${temporary_policy_recovery}" "${temporary_policy_file}"
+
+jq '(.Statement[] | select(.Sid == "ReadDefaultBillingViewData") | .Resource) = "*"' \
+  "${temporary_policy_file}" >"${temporary_policy_mutation}"
+mv "${temporary_policy_mutation}" "${temporary_policy_file}"
+chmod 600 "${temporary_policy_file}"
+jq -e 'any(.Statement[];
+  .Sid == "ReadDefaultBillingViewData" and .Resource == "*")' \
+  "${temporary_policy_file}" >/dev/null
+expect_verification_failure before stale-resolved-temporary-billing
 mv "${temporary_policy_recovery}" "${temporary_policy_file}"
 
 render_fake_terraform_state() {

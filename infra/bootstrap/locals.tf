@@ -25,4 +25,5 @@ locals {
   github_actions_boundary_arn  = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:policy/${local.github_actions_boundary_name}"
   temporary_policy_arn         = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:policy/${local.temporary_policy_name}"
   budget_arn                   = "arn:${data.aws_partition.current.partition}:budgets::${data.aws_caller_identity.current.account_id}:budget/${local.budget_name}"
+  primary_billing_view_arn     = "arn:${data.aws_partition.current.partition}:billing::${data.aws_caller_identity.current.account_id}:billingview/primary"
 }

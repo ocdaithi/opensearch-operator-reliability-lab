@@ -428,12 +428,11 @@ run "terraform_admin_policy_is_exact" {
     condition = (
       jsondecode(aws_iam_role_policy.terraform_admin.policy).Version == "2012-10-17" &&
       toset(keys(jsondecode(aws_iam_role_policy.terraform_admin.policy))) == toset(["Statement", "Version"]) &&
-      length(jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement) == 12 &&
+      length(jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement) == 11 &&
       toset([for statement in jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement : statement.Sid]) == toset([
         "AuditExactBootstrapUser",
         "DeleteReviewedTemporaryBootstrapPolicy",
         "DetachReviewedTemporaryBootstrapPolicy",
-        "ListExactTerraformStateKeys",
         "ManageBootstrapBudget",
         "ManageStateBucketControls",
         "ManageTerraformStateLock",
@@ -449,28 +448,10 @@ run "terraform_admin_policy_is_exact" {
         !contains(keys(statement), "NotAction") &&
         !contains(keys(statement), "NotResource") &&
         alltrue([for action in try(tolist(statement.Action), [statement.Action]) : !strcontains(action, "*")]) &&
-        alltrue([
-          for resource in try(tolist(statement.Resource), [statement.Resource]) :
-          resource != "*" || statement.Sid == "ReadDefaultBillingViewData"
-        ])
+        alltrue([for resource in try(tolist(statement.Resource), [statement.Resource]) : resource != "*"])
       ])
     )
-    error_message = "The Terraform administration policy must contain only the twelve reviewed allowing statements without wildcard actions, NotAction or NotResource."
-  }
-
-  assert {
-    condition = (
-      one([for statement in jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement : statement if statement.Sid == "ListExactTerraformStateKeys"]).Action == "s3:ListBucket" &&
-      one([for statement in jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement : statement if statement.Sid == "ListExactTerraformStateKeys"]).Resource == aws_s3_bucket.state.arn &&
-      toset(one([for statement in jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement : statement if statement.Sid == "ListExactTerraformStateKeys"]).Condition.StringEquals["s3:prefix"]) == toset([
-        "bootstrap/terraform.tfstate",
-        "bootstrap/terraform.tfstate.tflock",
-      ]) &&
-      toset(keys(one([for statement in jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement : statement if statement.Sid == "ListExactTerraformStateKeys"]))) == toset(["Action", "Condition", "Effect", "Resource", "Sid"]) &&
-      toset(keys(one([for statement in jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement : statement if statement.Sid == "ListExactTerraformStateKeys"]).Condition)) == toset(["StringEquals"]) &&
-      toset(keys(one([for statement in jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement : statement if statement.Sid == "ListExactTerraformStateKeys"]).Condition.StringEquals)) == toset(["s3:prefix"])
-    )
-    error_message = "The Terraform administration policy must list only the exact state and lock keys."
+    error_message = "The Terraform administration policy must contain only the eleven reviewed allowing statements without wildcard actions, resources, NotAction or NotResource."
   }
 
   assert {
@@ -531,10 +512,10 @@ run "terraform_admin_policy_is_exact" {
       one([for statement in jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement : statement if statement.Sid == "ManageBootstrapBudget"]).Resource == "arn:aws:budgets::${data.aws_caller_identity.current.account_id}:budget/opensearch-lab-monthly-cost" &&
       toset(keys(one([for statement in jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement : statement if statement.Sid == "ManageBootstrapBudget"]))) == toset(["Action", "Effect", "Resource", "Sid"]) &&
       one([for statement in jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement : statement if statement.Sid == "ReadDefaultBillingViewData"]).Action == "billing:GetBillingViewData" &&
-      one([for statement in jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement : statement if statement.Sid == "ReadDefaultBillingViewData"]).Resource == "*" &&
+      one([for statement in jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement : statement if statement.Sid == "ReadDefaultBillingViewData"]).Resource == "arn:${data.aws_partition.current.partition}:billing::${data.aws_caller_identity.current.account_id}:billingview/primary" &&
       toset(keys(one([for statement in jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement : statement if statement.Sid == "ReadDefaultBillingViewData"]))) == toset(["Action", "Effect", "Resource", "Sid"])
     )
-    error_message = "The Terraform administration policy must keep the exact budget actions and sole reviewed wildcard for billing view data."
+    error_message = "The Terraform administration policy must keep the exact budget actions and primary billing-view ARN."
   }
 
   assert {

@@ -29,7 +29,7 @@ resource "aws_iam_role" "terraform_admin" {
 }
 
 data "aws_iam_policy_document" "terraform_admin" {
-  source_policy_documents = [data.aws_iam_policy_document.state_backend_access.json]
+  source_policy_documents = [data.aws_iam_policy_document.state_object_access.json]
 
   statement {
     sid    = "ManageStateBucketControls"
@@ -80,7 +80,7 @@ data "aws_iam_policy_document" "terraform_admin" {
     sid       = "ReadDefaultBillingViewData"
     effect    = "Allow"
     actions   = ["billing:GetBillingViewData"]
-    resources = ["*"]
+    resources = [local.primary_billing_view_arn]
   }
 
   statement {

@@ -10,6 +10,9 @@
       ],
       "Resource": "arn:aws:s3:::__STATE_BUCKET_NAME__",
       "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
+        },
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
         },
@@ -49,31 +52,14 @@
       ],
       "Resource": "arn:aws:s3:::__STATE_BUCKET_NAME__",
       "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
+        },
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
         },
         "DateLessThan": {
           "aws:CurrentTime": "__TEMPORARY_POLICY_EXPIRY_UTC__"
-        }
-      }
-    },
-    {
-      "Sid": "ListExactTerraformStateKeys",
-      "Effect": "Allow",
-      "Action": "s3:ListBucket",
-      "Resource": "arn:aws:s3:::__STATE_BUCKET_NAME__",
-      "Condition": {
-        "ArnLike": {
-          "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
-        },
-        "DateLessThan": {
-          "aws:CurrentTime": "__TEMPORARY_POLICY_EXPIRY_UTC__"
-        },
-        "StringEquals": {
-          "s3:prefix": [
-            "bootstrap/terraform.tfstate",
-            "bootstrap/terraform.tfstate.tflock"
-          ]
         }
       }
     },
@@ -86,6 +72,9 @@
       ],
       "Resource": "arn:aws:s3:::__STATE_BUCKET_NAME__/bootstrap/terraform.tfstate",
       "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
+        },
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
         },
@@ -104,6 +93,9 @@
       ],
       "Resource": "arn:aws:s3:::__STATE_BUCKET_NAME__/bootstrap/terraform.tfstate.tflock",
       "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
+        },
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
         },
@@ -124,6 +116,9 @@
       ],
       "Resource": "arn:aws:budgets::__AWS_ACCOUNT_ID__:budget/opensearch-lab-monthly-cost",
       "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
+        },
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
         },
@@ -136,8 +131,11 @@
       "Sid": "ReadDefaultBillingViewData",
       "Effect": "Allow",
       "Action": "billing:GetBillingViewData",
-      "Resource": "*",
+      "Resource": "arn:aws:billing::__AWS_ACCOUNT_ID__:billingview/primary",
       "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
+        },
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
         },
@@ -156,6 +154,7 @@
       "Resource": "arn:aws:iam::__AWS_ACCOUNT_ID__:role/opensearch-lab-terraform-admin",
       "Condition": {
         "ArnEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap",
           "iam:PermissionsBoundary": "arn:aws:iam::__AWS_ACCOUNT_ID__:policy/opensearch-lab-terraform-admin-boundary"
         },
         "ArnLike": {
@@ -176,6 +175,7 @@
       "Resource": "arn:aws:iam::__AWS_ACCOUNT_ID__:role/opensearch-lab-github-actions",
       "Condition": {
         "ArnEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap",
           "iam:PermissionsBoundary": "arn:aws:iam::__AWS_ACCOUNT_ID__:policy/opensearch-lab-github-actions-boundary"
         },
         "ArnLike": {
@@ -202,6 +202,9 @@
         "arn:aws:iam::__AWS_ACCOUNT_ID__:role/opensearch-lab-github-actions"
       ],
       "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
+        },
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
         },
@@ -221,6 +224,9 @@
       ],
       "Resource": "arn:aws:iam::__AWS_ACCOUNT_ID__:oidc-provider/token.actions.githubusercontent.com",
       "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
+        },
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
         },
@@ -235,6 +241,9 @@
       "Action": "iam:GetUser",
       "Resource": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap",
       "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
+        },
         "ArnLike": {
           "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
         },

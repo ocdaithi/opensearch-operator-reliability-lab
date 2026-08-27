@@ -46,8 +46,8 @@ human_inline_name="opensearch-lab-bootstrap-management"
 github_inline_name="opensearch-lab-bootstrap-state"
 budget_name="opensearch-lab-monthly-cost"
 github_subject="repo:ocdaithi@321047870/opensearch-operator-reliability-lab@1346323330:environment:aws-bootstrap"
-temporary_template_digest="856ce1b87222cbb03b66085339670195f756591d652b3a4a2a134a3121aa9b3a"
-human_boundary_template_digest="ad115920994021f6d73f337c1744223458279a282f53ed9d6e516e85c65a040d"
+temporary_template_digest="e019c844afe18cb9b345734d83b54ce14a96d60061d36bf1e4675a29aa979829"
+human_boundary_template_digest="c8592acc57fea897687b8b9b12cba677d9411f47b5c92280c3576f57846ff906"
 github_boundary_template_digest="21a1c3d24734eceb43fa2b0dd69f0748a89e480b5e20fcb41dd04ffa72e6f8b7"
 
 if [[ ! -x "${backend_contract_script}" || ! -x "${contract_digest_script}" ]]; then
@@ -96,6 +96,45 @@ has_reviewed_digest() {
 
   actual_digest="$("${contract_digest_script}" "${policy_file}" 2>/dev/null)" || return 1
   [[ "${actual_digest}" == "${reviewed_digest}" ]]
+}
+
+has_reviewed_static_policy_contracts() {
+  jq -e '
+    def statement($sid):
+      [.Statement[] | select(.Sid == $sid)]
+      | if length == 1 then .[0] else null end;
+    . as $policy
+    | [.Statement[] | select(.Effect == "Allow")] as $allows
+    | ($policy.Statement | length) == 11
+      and ($allows | length) == 11
+      and all($policy.Statement[]; .Sid != "ListExactTerraformStateKeys")
+      and all($allows[];
+        .Condition.ArnEquals["aws:PrincipalArn"]
+          == "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
+        and .Condition.ArnLike["aws:SignInSessionArn"]
+          == "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+        and .Condition.DateLessThan["aws:CurrentTime"]
+          == "__TEMPORARY_POLICY_EXPIRY_UTC__"
+      )
+      and ($policy | statement("ReadDefaultBillingViewData") |
+        .Action == "billing:GetBillingViewData"
+        and .Resource
+          == "arn:aws:billing::__AWS_ACCOUNT_ID__:billingview/primary")
+  ' "${temporary_policy_template}" >/dev/null &&
+    jq -e '
+      def statement($sid):
+        [.Statement[] | select(.Sid == $sid)]
+        | if length == 1 then .[0] else null end;
+      . as $policy
+      | ($policy.Statement | length) == 11
+        and all($policy.Statement[]; .Sid != "ListExactTerraformStateKeys")
+        and ($policy | statement("ReadDefaultBillingViewData") |
+          .Action == "billing:GetBillingViewData"
+          and .Resource == (
+            "arn:__AWS_PARTITION__:billing::__AWS_ACCOUNT_ID__:"
+            + "billingview/primary"
+          ))
+    ' "${human_boundary_template}" >/dev/null
 }
 
 policy_documents_match() {
@@ -180,7 +219,8 @@ fi
 state_bucket_name="opensearch-lab-tfstate-ocdaithi-1346323330-eu-west-1"
 terraform_admin_role_arn="arn:${partition}:iam::${account_id}:role/${human_role_name}"
 
-if ! has_reviewed_digest "${temporary_policy_template}" "${temporary_template_digest}" ||
+if ! has_reviewed_static_policy_contracts ||
+  ! has_reviewed_digest "${temporary_policy_template}" "${temporary_template_digest}" ||
   ! has_reviewed_digest "${human_boundary_template}" "${human_boundary_template_digest}" ||
   ! has_reviewed_digest "${github_boundary_template}" "${github_boundary_template_digest}"; then
   fail "A tracked bootstrap policy template differs from its reviewed contract."
@@ -196,12 +236,25 @@ if ! render_resolved_policy "${human_boundary_template}" "${expected_human_bound
 fi
 
 if [[ "${verification_phase}" == "--before-removal" ]]; then
-  if ! temporary_expiry="$(jq -er '
-    [.Statement[] | select(.Effect == "Allow") |
-      .Condition.DateLessThan["aws:CurrentTime"]] as $expiries
-    | select((.Statement | length) == 12)
-    | select(($expiries | length) == 12)
+  if ! temporary_expiry="$(jq -er \
+    --arg billing_view_arn "arn:aws:billing::${account_id}:billingview/primary" \
+    --arg principal_arn "arn:aws:iam::${account_id}:user/${bootstrap_user_name}" '
+    . as $policy
+    | [.Statement[] | select(.Effect == "Allow")] as $allows
+    | [$allows[] | select(.Sid == "ReadDefaultBillingViewData")] as $billing_statements
+    | [$allows[].Condition.DateLessThan["aws:CurrentTime"]] as $expiries
+    | select(($policy.Statement | length) == 11)
+    | select(($allows | length) == 11)
+    | select(($expiries | length) == 11)
     | select(($expiries | unique | length) == 1)
+    | select(all($allows[];
+        .Condition.ArnEquals["aws:PrincipalArn"] == $principal_arn
+        and .Condition.ArnLike["aws:SignInSessionArn"]
+          == "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+      ))
+    | select(($billing_statements | length) == 1)
+    | select($billing_statements[0].Action == "billing:GetBillingViewData")
+    | select($billing_statements[0].Resource == $billing_view_arn)
     | $expiries[0] as $expiry
     | select($expiry | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
     | ($expiry | fromdateiso8601) as $expiry_epoch

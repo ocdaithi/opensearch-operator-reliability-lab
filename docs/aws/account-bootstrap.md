@@ -174,7 +174,7 @@ Use the AWS console with a root MFA session. Do not configure root CLI credentia
 
 Stop if any target exists. Do not import, adopt, overwrite, delete or repurpose it as part of this runbook.
 
-Create or verify the IAM user `opensearch-lab-bootstrap`. It must have console sign-in and a live MFA device, no access keys, no group membership, no inline policy and no user permissions boundary. At this point its only attached policy must be the AWS-managed `SignInLocalDevelopmentAccess` policy required by `aws login`.
+Create or verify the IAM user `opensearch-lab-bootstrap`. It must use the root IAM path `/`, because an IAM path forms part of the [user ARN](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference-arns.html) and the policies bind access to `arn:aws:iam::<ACCOUNT_ID>:user/opensearch-lab-bootstrap`. A user on any other path has a different ARN and cannot use these policies. It must have console sign-in and a live MFA device, no access keys, no group membership, no inline policy and no user permissions boundary. At this point its only attached policy must be the AWS-managed `SignInLocalDevelopmentAccess` policy required by `aws login`.
 
 Create the following customer-managed policies from the two private documents, preserving the exact names and contents:
 
@@ -200,6 +200,12 @@ jq --color-output . \
 The generator embeds one absolute UTC expiry exactly four hours after generation. Review the resolved document locally without copying its account-specific contents elsewhere. In the root console, create the customer-managed policy `opensearch-lab-temporary-bootstrap` from that file and attach it only to `opensearch-lab-bootstrap`. Then sign out of root.
 
 This policy is only for the initial bootstrap or an explicitly reviewed break-glass recovery. It is never used for routine Terraform. Every use requires a newly generated document because the absolute expiry is embedded in every allow statement. Never edit the expiry, extend an old policy, create a new version to refresh it or regenerate while an earlier policy is attached. If an attempt expires or fails, stop and assess any partial state. Remove the old attachment and policy before generating and creating a fresh one for an approved recovery.
+
+The temporary policy and the later Terraform administration policy allow `billing:GetBillingViewData` only for the account's primary billing view, `arn:aws:billing::<ACCOUNT_ID>:billingview/primary`. They do not grant access to custom billing views or other accounts' views. AWS defines the [billing-view ARN format](https://docs.aws.amazon.com/service-authorization/latest/reference/list_billing.html) and gives every account one [primary billing view](https://docs.aws.amazon.com/aws-cost-management/latest/APIReference/API_billing_ListBillingViews.html).
+
+The pinned AWS provider 6.61.0 calls `HeadBucket` while managing the state bucket. AWS authorises `HeadBucket` through [`s3:ListBucket`](https://docs.aws.amazon.com/AmazonS3/latest/userguide/security_iam_service-with-iam.html), so the temporary and Terraform administration policies include an unprefixed allowance on this dedicated bucket. This permits those identities to enumerate every object name in the bucket. The unprefixed listing does not grant object-content access. The policies grant object actions only on `bootstrap/terraform.tfstate`, which can be read and written, and `bootstrap/terraform.tfstate.tflock`, which can be read, written and deleted. The GitHub Actions role retains its separate `s3:prefix` condition, which restricts its listing to those two exact keys.
+
+The state bucket must remain dedicated to this bootstrap stack. Do not store other data in it or share it with unrelated Terraform stacks, because temporary and human administration can enumerate all names in the bucket.
 
 ### 5. Authenticate the exact bootstrap user
 
