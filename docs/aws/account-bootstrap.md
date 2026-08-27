@@ -356,9 +356,25 @@ Do not run `render-s3-backend.sh` during this migration flow and do not run `ter
 "${module_dir}/scripts/migrate-state.sh" --approved
 ```
 
-Stop on any error and follow the script's phase-specific diagnostic. If it reports a partial, indeterminate or committed migration, do not restore local state, delete remote objects, force-unlock, replace `backend.tf` or retry. On success, S3 is authoritative and the private pre-migration recovery copy remains for controlled recovery.
+Stop on any error and follow the script's phase-specific diagnostic. If it reports a partial or indeterminate migration, do not restore local state, delete remote objects, force-unlock, replace `backend.tf` or retry. If it reports a committed migration, S3 is authoritative: follow the recovery procedure below and never rerun `migrate-state.sh --approved` or `terraform init -migrate-state`. On success, S3 is authoritative and the private pre-migration recovery copy remains for controlled recovery.
 
 The migration keeps its mode-600 recovery and verification files under `.private/terraform-bootstrap/`: `pre-migration-*.tfstate`, `post-migration-*.tfstate`, `pre-migration-backend-*.tf`, an optional `pre-migration-backend-cache-*.tfstate` and `post-migration-lock-check.tfplan`. Never stage, paste or publish these files, the resolved policies, `terraform.tfvars`, `terraform.tfstate`, `infra/bootstrap/backend.tf`, the repository-local `.aws/` directory or the AWS CLI role cache at `~/.aws/cli/cache`.
+
+#### Resume verification after a committed migration
+
+Use this mode only when the migration into the previously proven-empty S3 destination committed but a later verification step failed. Keep the S3 backend, its cached metadata and every retained recovery file unchanged. Do not use `terraform state push`, reactivate the local state or select a recovery pair manually.
+
+Restore the bootstrap shell environment and AWS login session described above, then run:
+
+```bash
+"${module_dir}/scripts/migrate-state.sh" --resume-verification
+```
+
+The full form is `migrate-state.sh --resume-verification [variables-file]`. Pass the optional second argument only when the committed migration used a separately reviewed private variables file; otherwise the script uses `.private/terraform-bootstrap/terraform.tfvars`.
+
+The guarded mode requires the exact S3 backend and matching cached backend metadata. It selects the latest complete retained pre/post migration pair, pulls the current authoritative state to a private temporary file, verifies it against the retained migrated state and the empty-destination migration contract, runs the remote-backed `-refresh=false -detailed-exitcode` plan and requires exit 0, then proves that no state lock remains. It does not migrate, push or reactivate state.
+
+On failure, stop and retain all recovery evidence. Correct only the reported verification problem, then rerun `--resume-verification`; never rerun `--approved` after the migration has committed. Continue with step 9 only after resume verification succeeds.
 
 ### 9. Verify before removing temporary access
 

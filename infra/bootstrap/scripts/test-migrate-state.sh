@@ -46,11 +46,89 @@ make_fixture() {
     "${fixture_root}/infra/bootstrap/backend.local.tf.example"
   printf 'budget_notification_email = "private@example.com"\n' \
     >"${fixture_root}/.private/terraform-bootstrap/terraform.tfvars"
-  printf '%s\n' \
-    '{"version":4,"terraform_version":"1.15.9","serial":4,"lineage":"fixture-lineage","outputs":{"fixture":{"value":"unchanged","type":"string"}},"resources":[]}' \
-    >"${fixture_root}/.private/terraform-bootstrap/terraform.tfstate"
+  cat >"${fixture_root}/.private/terraform-bootstrap/terraform.tfstate" <<'EOF'
+{
+  "version": 4,
+  "terraform_version": "1.15.9",
+  "serial": 4,
+  "lineage": "fixture-lineage",
+  "outputs": {
+    "fixture": {
+      "value": "unchanged",
+      "type": "string"
+    }
+  },
+  "resources": [
+    {
+      "mode": "managed",
+      "type": "terraform_data",
+      "name": "fixture",
+      "provider": "provider[\"terraform.io/builtin/terraform\"]",
+      "instances": [
+        {
+          "schema_version": 0,
+          "identity_schema_version": 0,
+          "attributes": {
+            "id": "fixture",
+            "input": "unchanged",
+            "output": "unchanged"
+          },
+          "sensitive_attributes": []
+        }
+      ]
+    }
+  ],
+  "check_results": [
+    {
+      "object_kind": "resource",
+      "config_addr": "terraform_data.fixture",
+      "status": "pass",
+      "objects": [
+        {
+          "object_addr": "terraform_data.fixture",
+          "status": "pass"
+        }
+      ]
+    },
+    {
+      "object_kind": "check",
+      "config_addr": "check.fixture",
+      "status": "fail",
+      "objects": [
+        {
+          "object_addr": "check.fixture",
+          "status": "fail",
+          "failure_messages": [
+            "first failure",
+            "second failure"
+          ]
+        },
+        {
+          "object_addr": "check.fixture[\"nested\"]",
+          "status": "pass",
+          "failure_messages": null
+        }
+      ]
+    },
+    {
+      "object_kind": "output",
+      "config_addr": "output.fixture",
+      "status": "pass"
+    },
+    {
+      "object_kind": "var",
+      "config_addr": "var.fixture",
+      "status": "pass",
+      "objects": null
+    }
+  ]
+}
+EOF
   cp "${fixture_root}/.private/terraform-bootstrap/terraform.tfstate" \
     "${fixture_root}/expected-local-state.tfstate"
+  jq -c '.lineage = "fixture-remote-lineage" | .serial = 1' \
+    "${fixture_root}/expected-local-state.tfstate" \
+    >"${fixture_root}/expected-migrated-state.tfstate"
   printf '%s\n' '{"backend":{"type":"local"},"fixture":"validated-local-cache"}' \
     >"${fixture_root}/expected-backend-cache.tfstate"
   cp "${fixture_root}/expected-backend-cache.tfstate" \
@@ -58,6 +136,7 @@ make_fixture() {
   chmod 600 \
     "${fixture_root}/expected-backend-cache.tfstate" \
     "${fixture_root}/expected-local-state.tfstate" \
+    "${fixture_root}/expected-migrated-state.tfstate" \
     "${fixture_root}/.private/terraform-bootstrap/terraform.tfstate" \
     "${fixture_root}/infra/bootstrap/.terraform/terraform.tfstate"
   cp "${fixture_root}/infra/bootstrap/backend.tf" "${fixture_root}/expected-backend.tf"
@@ -77,13 +156,44 @@ backend_file="${fixture_root}/infra/bootstrap/backend.tf"
 backend_cache="${fixture_root}/infra/bootstrap/.terraform/terraform.tfstate"
 local_state="${fixture_root}/.private/terraform-bootstrap/terraform.tfstate"
 expected_local_state="${fixture_root}/expected-local-state.tfstate"
+expected_migrated_state="${fixture_root}/expected-migrated-state.tfstate"
 remote_state="${fixture_root}/remote-store/bootstrap/terraform.tfstate"
 remote_lock="${fixture_root}/remote-store/bootstrap/terraform.tfstate.tflock"
 migration_attempted="${fixture_root}/migration-attempted"
 
+write_s3_backend_cache() {
+  local account_id
+  local role_arn
+
+  account_id="$(printf '%06d%06d' 123 456)"
+  role_arn="arn:aws:iam::${account_id}:role/opensearch-lab-terraform-admin"
+  jq -cn --arg role_arn "${role_arn}" '
+    {
+      version: 3,
+      terraform_version: "1.15.9",
+      backend: {
+        type: "s3",
+        config: {
+          bucket: "opensearch-lab-tfstate-ocdaithi-1346323330-eu-west-1",
+          key: "bootstrap/terraform.tfstate",
+          region: "eu-west-1",
+          profile: "opensearch-lab-terraform",
+          encrypt: true,
+          use_lockfile: true,
+          assume_role: {
+            role_arn: $role_arn,
+            session_name: "terraform-bootstrap-state"
+          }
+        },
+        hash: 12345
+      }
+    }
+  ' >"${backend_cache}"
+}
+
 case "$*" in
   *" init -migrate-state "*)
-    printf '%s\n' '{"backend":{"type":"s3"},"fixture":"remote-cache"}' >"${backend_cache}"
+    write_s3_backend_cache
     : >"${migration_attempted}"
 
     case "${FAKE_MIGRATION_FAILURE:-none}" in
@@ -95,7 +205,7 @@ case "$*" in
         exit 42
         ;;
       after-state)
-        /bin/cp "${local_state}" "${remote_state}"
+        /bin/cp "${expected_migrated_state}" "${remote_state}"
         rm -f -- "${local_state}"
         exit 42
         ;;
@@ -104,7 +214,7 @@ case "$*" in
         exit 143
         ;;
       none)
-        /bin/cp "${local_state}" "${remote_state}"
+        /bin/cp "${expected_migrated_state}" "${remote_state}"
         rm -f -- "${local_state}"
         ;;
       *)
@@ -115,6 +225,7 @@ case "$*" in
     esac
     ;;
   *" init -reconfigure "*)
+    : >"${fixture_root}/local-reactivation-attempted"
     cp "${fixture_root}/expected-backend-cache.tfstate" "${backend_cache}"
     ;;
   *" workspace show")
@@ -125,6 +236,10 @@ case "$*" in
     if [[ "${FAKE_EXTRA_WORKSPACE:-false}" == "true" ]]; then
       printf '  inactive\n'
     fi
+    ;;
+  *" state push "*)
+    : >"${fixture_root}/state-push-attempted"
+    exit 94
     ;;
   *" state pull")
     if grep -Fq 'backend "s3"' "${backend_file}"; then
@@ -141,25 +256,101 @@ case "$*" in
         exit 47
       fi
       case "${FAKE_STATE_VERIFICATION:-valid}" in
-        lineage-mismatch)
-          jq -c '.terraform_version = "1.16.0" | .lineage = "unexpected-lineage"' \
+        duplicate-aggregate)
+          jq -c '.check_results += [.check_results[0]]' "${remote_state}"
+          ;;
+        duplicate-object)
+          jq -c \
+            '.check_results[1].objects += [.check_results[1].objects[0]]' \
             "${remote_state}"
           ;;
-        serial-regression)
-          jq -c '.terraform_version = "1.16.0" | .serial = 3' "${remote_state}"
+        aggregate-status-changed)
+          jq -c '.check_results[0].status = "fail"' "${remote_state}"
           ;;
-        serial-advance)
-          jq -c '.terraform_version = "1.16.0" | .serial = 5' "${remote_state}"
+        object-status-changed)
+          jq -c '.check_results[0].objects[0].status = "fail"' "${remote_state}"
           ;;
-        semantic-mismatch)
-          jq -c '.terraform_version = "1.16.0" | .outputs.fixture.value = "changed"' \
+        aggregate-address-changed)
+          jq -c '.check_results[0].config_addr = "terraform_data.changed"' \
             "${remote_state}"
+          ;;
+        object-address-changed)
+          jq -c \
+            '.check_results[1].objects[0].object_addr = "check.changed"' \
+            "${remote_state}"
+          ;;
+        failure-message-changed)
+          jq -c \
+            '.check_results[1].objects[0].failure_messages[0] = "changed"' \
+            "${remote_state}"
+          ;;
+        failure-message-order-changed)
+          jq -c \
+            '.check_results[1].objects[0].failure_messages |= reverse' \
+            "${remote_state}"
+          ;;
+        resource-changed)
+          jq -c '.resources[0].instances[0].attributes.input = "changed"' \
+            "${remote_state}"
+          ;;
+        output-changed)
+          jq -c '.outputs.fixture.value = "changed"' "${remote_state}"
+          ;;
+        version-missing)
+          jq -c 'del(.version)' "${remote_state}"
+          ;;
+        version-invalid)
+          jq -c '.version = 3' "${remote_state}"
           ;;
         terraform-version-missing)
           jq -c 'del(.terraform_version)' "${remote_state}"
           ;;
-        *)
+        terraform-version-invalid)
+          jq -c '.terraform_version = ""' "${remote_state}"
+          ;;
+        terraform-version-changed)
           jq -c '.terraform_version = "1.16.0"' "${remote_state}"
+          ;;
+        lineage-missing)
+          jq -c 'del(.lineage)' "${remote_state}"
+          ;;
+        lineage-invalid)
+          jq -c '.lineage = ""' "${remote_state}"
+          ;;
+        serial-invalid)
+          jq -c '.serial = 1.5' "${remote_state}"
+          ;;
+        serial-zero)
+          jq -c '.serial = 0' "${remote_state}"
+          ;;
+        serial-two)
+          jq -c '.serial = 2' "${remote_state}"
+          ;;
+        serial-four)
+          jq -c '.serial = 4' "${remote_state}"
+          ;;
+        serial-five)
+          jq -c '.serial = 5' "${remote_state}"
+          ;;
+        top-level-schema-changed)
+          jq -c '.unexpected = true' "${remote_state}"
+          ;;
+        aggregate-kind-invalid)
+          jq -c '.check_results[0].object_kind = "unknown"' "${remote_state}"
+          ;;
+        aggregate-schema-changed)
+          jq -c '.check_results[0].unexpected = true' "${remote_state}"
+          ;;
+        object-schema-changed)
+          jq -c '.check_results[0].objects[0].unexpected = true' "${remote_state}"
+          ;;
+        valid)
+          jq -c '.' "${remote_state}"
+          ;;
+        *)
+          printf 'Unknown fake state verification mode: %s\n' \
+            "${FAKE_STATE_VERIFICATION}" >&2
+          exit 95
           ;;
       esac
     elif [[ "${FAKE_STATE_VERIFICATION:-valid}" == "local-recovery-mismatch" ]]; then
@@ -367,6 +558,160 @@ file_mode() {
   fi
 }
 
+transform_json_file() {
+  local state_file="$1"
+  local filter="$2"
+  local transformed_state="${state_file}.transformed"
+
+  jq -c "${filter}" "${state_file}" >"${transformed_state}"
+  chmod 600 "${transformed_state}"
+  mv "${transformed_state}" "${state_file}"
+}
+
+transform_migrated_state() {
+  local fixture_root="$1"
+  local filter="$2"
+
+  transform_json_file \
+    "${fixture_root}/expected-migrated-state.tfstate" \
+    "${filter}"
+}
+
+prepare_committed_fixture() {
+  local fixture_root="$1"
+  local account_id
+  local role_arn
+  local old_run_id="20260827T120000Z-99"
+  local retained_run_id="20260827T120000Z-200"
+  local incomplete_run_id="20260827T120001Z-300"
+
+  account_id="$(printf '%06d%06d' 123 456)"
+  role_arn="arn:aws:iam::${account_id}:role/opensearch-lab-terraform-admin"
+
+  cat >"${fixture_root}/infra/bootstrap/backend.tf" <<EOF
+terraform {
+  backend "s3" {
+    bucket       = "opensearch-lab-tfstate-ocdaithi-1346323330-eu-west-1"
+    key          = "bootstrap/terraform.tfstate"
+    profile      = "opensearch-lab-terraform"
+    region       = "eu-west-1"
+    encrypt      = true
+    use_lockfile = true
+
+    assume_role = {
+      role_arn     = "${role_arn}"
+      session_name = "terraform-bootstrap-state"
+    }
+  }
+}
+EOF
+  jq -cn --arg role_arn "${role_arn}" '
+    {
+      version: 3,
+      terraform_version: "1.15.9",
+      backend: {
+        type: "s3",
+        config: {
+          bucket: "opensearch-lab-tfstate-ocdaithi-1346323330-eu-west-1",
+          key: "bootstrap/terraform.tfstate",
+          region: "eu-west-1",
+          profile: "opensearch-lab-terraform",
+          encrypt: true,
+          use_lockfile: true,
+          assume_role: {
+            role_arn: $role_arn,
+            session_name: "terraform-bootstrap-state"
+          }
+        },
+        hash: 12345
+      }
+    }
+  ' >"${fixture_root}/infra/bootstrap/.terraform/terraform.tfstate"
+
+  cp "${fixture_root}/expected-migrated-state.tfstate" \
+    "${fixture_root}/remote-store/bootstrap/terraform.tfstate"
+  rm -f -- "${fixture_root}/.private/terraform-bootstrap/terraform.tfstate"
+
+  cp "${fixture_root}/expected-local-state.tfstate" \
+    "${fixture_root}/.private/terraform-bootstrap/pre-migration-${old_run_id}.tfstate"
+  cp "${fixture_root}/expected-local-state.tfstate" \
+    "${fixture_root}/.private/terraform-bootstrap/post-migration-${old_run_id}.tfstate"
+  cp "${fixture_root}/expected-local-state.tfstate" \
+    "${fixture_root}/.private/terraform-bootstrap/pre-migration-${retained_run_id}.tfstate"
+  cp "${fixture_root}/expected-migrated-state.tfstate" \
+    "${fixture_root}/.private/terraform-bootstrap/post-migration-${retained_run_id}.tfstate"
+  cp "${fixture_root}/expected-local-state.tfstate" \
+    "${fixture_root}/.private/terraform-bootstrap/pre-migration-${incomplete_run_id}.tfstate"
+
+  chmod 600 \
+    "${fixture_root}/infra/bootstrap/backend.tf" \
+    "${fixture_root}/infra/bootstrap/.terraform/terraform.tfstate" \
+    "${fixture_root}/remote-store/bootstrap/terraform.tfstate" \
+    "${fixture_root}/.private/terraform-bootstrap/pre-migration-${old_run_id}.tfstate" \
+    "${fixture_root}/.private/terraform-bootstrap/post-migration-${old_run_id}.tfstate" \
+    "${fixture_root}/.private/terraform-bootstrap/pre-migration-${retained_run_id}.tfstate" \
+    "${fixture_root}/.private/terraform-bootstrap/post-migration-${retained_run_id}.tfstate" \
+    "${fixture_root}/.private/terraform-bootstrap/pre-migration-${incomplete_run_id}.tfstate"
+  chmod 700 "${fixture_root}/.private/terraform-bootstrap"
+}
+
+capture_resume_files() {
+  local fixture_root="$1"
+
+  cp "${fixture_root}/infra/bootstrap/backend.tf" \
+    "${fixture_root}/expected-resume-backend.tf"
+  cp "${fixture_root}/infra/bootstrap/.terraform/terraform.tfstate" \
+    "${fixture_root}/expected-resume-backend-cache.tfstate"
+  cp "${fixture_root}/remote-store/bootstrap/terraform.tfstate" \
+    "${fixture_root}/expected-resume-remote.tfstate"
+  cp -R "${fixture_root}/.private/terraform-bootstrap" \
+    "${fixture_root}/expected-resume-private"
+  file_mode "${fixture_root}/infra/bootstrap/backend.tf" \
+    >"${fixture_root}/expected-resume-backend.mode"
+  file_mode "${fixture_root}/infra/bootstrap/.terraform/terraform.tfstate" \
+    >"${fixture_root}/expected-resume-backend-cache.mode"
+  file_mode "${fixture_root}/remote-store/bootstrap/terraform.tfstate" \
+    >"${fixture_root}/expected-resume-remote.mode"
+}
+
+assert_resume_preserved_state() {
+  local fixture_root="$1"
+  local commands_log="${fixture_root}/commands.log"
+  local expected_file
+  local retained_file
+
+  cmp -s "${fixture_root}/expected-resume-backend.tf" \
+    "${fixture_root}/infra/bootstrap/backend.tf"
+  cmp -s "${fixture_root}/expected-resume-backend-cache.tfstate" \
+    "${fixture_root}/infra/bootstrap/.terraform/terraform.tfstate"
+  cmp -s "${fixture_root}/expected-resume-remote.tfstate" \
+    "${fixture_root}/remote-store/bootstrap/terraform.tfstate"
+  test "$(file_mode "${fixture_root}/infra/bootstrap/backend.tf")" = \
+    "$(<"${fixture_root}/expected-resume-backend.mode")"
+  test "$(file_mode "${fixture_root}/infra/bootstrap/.terraform/terraform.tfstate")" = \
+    "$(<"${fixture_root}/expected-resume-backend-cache.mode")"
+  test "$(file_mode "${fixture_root}/remote-store/bootstrap/terraform.tfstate")" = \
+    "$(<"${fixture_root}/expected-resume-remote.mode")"
+  test ! -e "${fixture_root}/.private/terraform-bootstrap/terraform.tfstate"
+  test ! -e "${fixture_root}/migration-attempted"
+  test ! -e "${fixture_root}/local-reactivation-attempted"
+  test ! -e "${fixture_root}/state-push-attempted"
+
+  if [[ -s "${commands_log}" ]] && grep -Eq \
+    ' init | state push ' "${commands_log}"; then
+    echo "Resume verification invoked a forbidden Terraform operation." >&2
+    exit 1
+  fi
+
+  while IFS= read -r expected_file; do
+    retained_file="${fixture_root}/.private/terraform-bootstrap/${expected_file#*/expected-resume-private/}"
+    cmp -s "${expected_file}" "${retained_file}"
+  done < <(find "${fixture_root}/expected-resume-private" -type f \
+    \( -name 'pre-migration-*.tfstate' -o -name 'post-migration-*.tfstate' \) \
+    -print)
+  assert_invocation_lock_released "${fixture_root}"
+}
+
 recovery_state_file() {
   local fixture_root="$1"
 
@@ -414,7 +759,7 @@ assert_s3_backend_preserved() {
   local fixture_root="$1"
 
   grep -Fq 'backend "s3"' "${fixture_root}/infra/bootstrap/backend.tf"
-  grep -Fq '"fixture":"remote-cache"' \
+  grep -Fq '"type":"s3"' \
     "${fixture_root}/infra/bootstrap/.terraform/terraform.tfstate"
   assert_mode_600 "${fixture_root}/infra/bootstrap/backend.tf"
   assert_mode_600 "${fixture_root}/infra/bootstrap/.terraform/terraform.tfstate"
@@ -426,7 +771,7 @@ assert_remote_authoritative() {
   local fixture_root="$1"
 
   assert_s3_backend_preserved "${fixture_root}"
-  cmp -s "${fixture_root}/expected-local-state.tfstate" \
+  cmp -s "${fixture_root}/expected-migrated-state.tfstate" \
     "${fixture_root}/remote-store/bootstrap/terraform.tfstate"
   test ! -e "${fixture_root}/.private/terraform-bootstrap/terraform.tfstate"
 }
@@ -483,6 +828,75 @@ grep -Fq -- '--prefix bootstrap/terraform.tfstate --no-paginate --output json' \
   "${success_log}"
 grep -Fq -- '--prefix bootstrap/terraform.tfstate.tflock --no-paginate --output json' \
   "${success_log}"
+jq -e -s '
+  .[0].version == 4
+  and .[1].version == 4
+  and .[0].terraform_version == "1.15.9"
+  and .[1].terraform_version == "1.15.9"
+  and .[0].lineage != .[1].lineage
+  and (.[1].lineage | type == "string" and length > 0)
+  and .[1].serial == 1
+' \
+  "${success_fixture}/expected-local-state.tfstate" \
+  "${success_fixture}/remote-store/bootstrap/terraform.tfstate" >/dev/null
+
+exact_metadata_fixture="$(make_fixture exact-metadata-preserved)"
+cp "${exact_metadata_fixture}/expected-local-state.tfstate" \
+  "${exact_metadata_fixture}/expected-migrated-state.tfstate"
+chmod 600 "${exact_metadata_fixture}/expected-migrated-state.tfstate"
+PATH="${exact_metadata_fixture}/bin:${PATH}" \
+  FAKE_LOG="${exact_metadata_fixture}/commands.log" \
+  "${exact_metadata_fixture}/infra/bootstrap/scripts/migrate-state.sh" --approved \
+  >/dev/null
+assert_remote_authoritative "${exact_metadata_fixture}"
+
+future_exact_metadata_fixture="$(make_fixture future-exact-metadata-preserved)"
+transform_json_file \
+  "${future_exact_metadata_fixture}/.private/terraform-bootstrap/terraform.tfstate" \
+  '.terraform_version = "1.16.0"'
+cp "${future_exact_metadata_fixture}/.private/terraform-bootstrap/terraform.tfstate" \
+  "${future_exact_metadata_fixture}/expected-local-state.tfstate"
+cp "${future_exact_metadata_fixture}/.private/terraform-bootstrap/terraform.tfstate" \
+  "${future_exact_metadata_fixture}/expected-migrated-state.tfstate"
+chmod 600 \
+  "${future_exact_metadata_fixture}/expected-local-state.tfstate" \
+  "${future_exact_metadata_fixture}/expected-migrated-state.tfstate"
+PATH="${future_exact_metadata_fixture}/bin:${PATH}" \
+  FAKE_LOG="${future_exact_metadata_fixture}/commands.log" \
+  "${future_exact_metadata_fixture}/infra/bootstrap/scripts/migrate-state.sh" \
+  --approved >/dev/null
+assert_remote_authoritative "${future_exact_metadata_fixture}"
+
+aggregate_order_fixture="$(make_fixture reordered-check-aggregates)"
+transform_migrated_state "${aggregate_order_fixture}" '.check_results |= reverse'
+PATH="${aggregate_order_fixture}/bin:${PATH}" \
+  FAKE_LOG="${aggregate_order_fixture}/commands.log" \
+  "${aggregate_order_fixture}/infra/bootstrap/scripts/migrate-state.sh" --approved \
+  >/dev/null
+assert_remote_authoritative "${aggregate_order_fixture}"
+
+object_order_fixture="$(make_fixture reordered-check-objects)"
+transform_migrated_state \
+  "${object_order_fixture}" \
+  '.check_results[1].objects |= reverse'
+PATH="${object_order_fixture}/bin:${PATH}" \
+  FAKE_LOG="${object_order_fixture}/commands.log" \
+  "${object_order_fixture}/infra/bootstrap/scripts/migrate-state.sh" --approved \
+  >/dev/null
+assert_remote_authoritative "${object_order_fixture}"
+
+normalised_checks_fixture="$(make_fixture normalised-empty-check-fields)"
+transform_migrated_state \
+  "${normalised_checks_fixture}" \
+  '.check_results[0].objects[0].failure_messages = []
+  | .check_results[1].objects[1] |= del(.failure_messages)
+  | .check_results[2].objects = []
+  | .check_results[3] |= del(.objects)'
+PATH="${normalised_checks_fixture}/bin:${PATH}" \
+  FAKE_LOG="${normalised_checks_fixture}/commands.log" \
+  "${normalised_checks_fixture}/infra/bootstrap/scripts/migrate-state.sh" --approved \
+  >/dev/null
+assert_remote_authoritative "${normalised_checks_fixture}"
 
 approval_fixture="$(make_fixture approval)"
 approval_error="${approval_fixture}/migration-error.txt"
@@ -810,7 +1224,33 @@ assert_committed_failure \
   "Remote state could not be pulled after migration committed."
 record_negative_case "remote-pull-failure-keeps-s3-authoritative"
 
-for mismatch in lineage-mismatch serial-regression serial-advance semantic-mismatch terraform-version-missing; do
+for mismatch in \
+  duplicate-aggregate \
+  duplicate-object \
+  aggregate-status-changed \
+  object-status-changed \
+  aggregate-address-changed \
+  object-address-changed \
+  failure-message-changed \
+  failure-message-order-changed \
+  resource-changed \
+  output-changed \
+  version-missing \
+  version-invalid \
+  terraform-version-missing \
+  terraform-version-invalid \
+  terraform-version-changed \
+  lineage-missing \
+  lineage-invalid \
+  serial-invalid \
+  serial-zero \
+  serial-two \
+  serial-four \
+  serial-five \
+  top-level-schema-changed \
+  aggregate-kind-invalid \
+  aggregate-schema-changed \
+  object-schema-changed; do
   mismatch_fixture="$(make_fixture "state-${mismatch}")"
   mismatch_error="${mismatch_fixture}/migration-error.txt"
   if PATH="${mismatch_fixture}/bin:${PATH}" \
@@ -828,6 +1268,66 @@ for mismatch in lineage-mismatch serial-regression serial-advance semantic-misma
     "${mismatch_error}" \
     "Remote state differs from the recovered local state."
   record_negative_case "state-${mismatch}-keeps-s3-authoritative"
+done
+
+future_exception_fixture="$(make_fixture future-version-new-lineage)"
+transform_json_file \
+  "${future_exception_fixture}/.private/terraform-bootstrap/terraform.tfstate" \
+  '.terraform_version = "1.16.0"'
+cp "${future_exception_fixture}/.private/terraform-bootstrap/terraform.tfstate" \
+  "${future_exception_fixture}/expected-local-state.tfstate"
+transform_json_file \
+  "${future_exception_fixture}/expected-migrated-state.tfstate" \
+  '.terraform_version = "1.16.0"'
+chmod 600 \
+  "${future_exception_fixture}/expected-local-state.tfstate" \
+  "${future_exception_fixture}/expected-migrated-state.tfstate"
+future_exception_error="${future_exception_fixture}/migration-error.txt"
+if PATH="${future_exception_fixture}/bin:${PATH}" \
+  FAKE_LOG="${future_exception_fixture}/commands.log" \
+  "${future_exception_fixture}/infra/bootstrap/scripts/migrate-state.sh" \
+  --approved >/dev/null 2>"${future_exception_error}"; then
+  echo "Migration unexpectedly applied the 1.15.9 metadata exception to another version." >&2
+  exit 1
+fi
+assert_committed_failure \
+  "future-version-new-lineage-keeps-s3-authoritative" \
+  "${future_exception_fixture}" \
+  "${future_exception_error}" \
+  "Remote state differs from the recovered local state."
+record_negative_case "future-version-new-lineage-keeps-s3-authoritative"
+
+for invalid_source_schema in version check-aggregate; do
+  source_schema_fixture="$(make_fixture "source-${invalid_source_schema}-invalid")"
+  case "${invalid_source_schema}" in
+    version)
+      source_schema_filter='.version = 3'
+      ;;
+    check-aggregate)
+      source_schema_filter='.check_results[0].unexpected = true'
+      ;;
+  esac
+  transform_json_file \
+    "${source_schema_fixture}/.private/terraform-bootstrap/terraform.tfstate" \
+    "${source_schema_filter}"
+  cp "${source_schema_fixture}/.private/terraform-bootstrap/terraform.tfstate" \
+    "${source_schema_fixture}/expected-local-state.tfstate"
+  chmod 600 "${source_schema_fixture}/expected-local-state.tfstate"
+  source_schema_error="${source_schema_fixture}/migration-error.txt"
+  if PATH="${source_schema_fixture}/bin:${PATH}" \
+    FAKE_LOG="${source_schema_fixture}/commands.log" \
+    "${source_schema_fixture}/infra/bootstrap/scripts/migrate-state.sh" --approved \
+    >/dev/null 2>"${source_schema_error}"; then
+    printf 'Migration unexpectedly accepted invalid source schema: %s.\n' \
+      "${invalid_source_schema}" >&2
+    exit 1
+  fi
+  assert_committed_failure \
+    "source-${invalid_source_schema}-invalid" \
+    "${source_schema_fixture}" \
+    "${source_schema_error}" \
+    "Remote state differs from the recovered local state."
+  record_negative_case "source-${invalid_source_schema}-invalid"
 done
 
 for plan_exit in 1 2; do
@@ -853,6 +1353,159 @@ for plan_exit in 1 2; do
     "${plan_diagnostic}"
   record_negative_case "plan-exit-${plan_exit}-keeps-s3-authoritative"
 done
+
+resume_fixture="$(make_fixture resume-verification)"
+transform_migrated_state \
+  "${resume_fixture}" \
+  '.check_results[1].objects |= reverse | .check_results |= reverse'
+prepare_committed_fixture "${resume_fixture}"
+capture_resume_files "${resume_fixture}"
+PATH="${resume_fixture}/bin:${PATH}" \
+  FAKE_LOG="${resume_fixture}/commands.log" \
+  "${resume_fixture}/infra/bootstrap/scripts/migrate-state.sh" \
+  --resume-verification >/dev/null
+assert_resume_preserved_state "${resume_fixture}"
+grep -Fq ' state pull' "${resume_fixture}/commands.log"
+grep -Fq ' plan ' "${resume_fixture}/commands.log"
+grep -Fq -- '-detailed-exitcode' "${resume_fixture}/commands.log"
+grep -Fq -- '-refresh=false' "${resume_fixture}/commands.log"
+
+resume_backend_fixture="$(make_fixture resume-local-backend-rejected)"
+prepare_committed_fixture "${resume_backend_fixture}"
+cp "${resume_backend_fixture}/expected-backend.tf" \
+  "${resume_backend_fixture}/infra/bootstrap/backend.tf"
+capture_resume_files "${resume_backend_fixture}"
+resume_backend_error="${resume_backend_fixture}/migration-error.txt"
+if PATH="${resume_backend_fixture}/bin:${PATH}" \
+  FAKE_LOG="${resume_backend_fixture}/commands.log" \
+  "${resume_backend_fixture}/infra/bootstrap/scripts/migrate-state.sh" \
+  --resume-verification >/dev/null 2>"${resume_backend_error}"; then
+  echo "Resume verification unexpectedly accepted the local backend." >&2
+  exit 1
+fi
+assert_expected_failure_output \
+  "resume-local-backend-rejected" \
+  "${resume_backend_error}" \
+  "The active backend does not match the exact S3 migration contract."
+assert_resume_preserved_state "${resume_backend_fixture}"
+record_negative_case "resume-local-backend-rejected"
+
+resume_cache_fixture="$(make_fixture resume-cache-mismatch)"
+prepare_committed_fixture "${resume_cache_fixture}"
+jq -c '.backend.config.key = "unexpected.tfstate"' \
+  "${resume_cache_fixture}/infra/bootstrap/.terraform/terraform.tfstate" \
+  >"${resume_cache_fixture}/mismatched-backend-cache.tfstate"
+mv "${resume_cache_fixture}/mismatched-backend-cache.tfstate" \
+  "${resume_cache_fixture}/infra/bootstrap/.terraform/terraform.tfstate"
+chmod 600 "${resume_cache_fixture}/infra/bootstrap/.terraform/terraform.tfstate"
+capture_resume_files "${resume_cache_fixture}"
+resume_cache_error="${resume_cache_fixture}/migration-error.txt"
+if PATH="${resume_cache_fixture}/bin:${PATH}" \
+  FAKE_LOG="${resume_cache_fixture}/commands.log" \
+  "${resume_cache_fixture}/infra/bootstrap/scripts/migrate-state.sh" \
+  --resume-verification >/dev/null 2>"${resume_cache_error}"; then
+  echo "Resume verification unexpectedly accepted mismatched backend metadata." >&2
+  exit 1
+fi
+assert_expected_failure_output \
+  "resume-cache-mismatch" \
+  "${resume_cache_error}" \
+  "Terraform's cached backend metadata does not match the active S3 backend."
+assert_resume_preserved_state "${resume_cache_fixture}"
+record_negative_case "resume-cache-mismatch"
+
+resume_remote_fixture="$(make_fixture resume-current-remote-mismatch)"
+prepare_committed_fixture "${resume_remote_fixture}"
+capture_resume_files "${resume_remote_fixture}"
+resume_remote_error="${resume_remote_fixture}/migration-error.txt"
+if PATH="${resume_remote_fixture}/bin:${PATH}" \
+  FAKE_LOG="${resume_remote_fixture}/commands.log" \
+  FAKE_STATE_VERIFICATION=output-changed \
+  "${resume_remote_fixture}/infra/bootstrap/scripts/migrate-state.sh" \
+  --resume-verification >/dev/null 2>"${resume_remote_error}"; then
+  echo "Resume verification unexpectedly accepted changed remote state." >&2
+  exit 1
+fi
+assert_expected_failure_output \
+  "resume-current-remote-mismatch" \
+  "${resume_remote_error}" \
+  "Current remote state differs from the retained post-migration state."
+assert_resume_preserved_state "${resume_remote_fixture}"
+record_negative_case "resume-current-remote-mismatch"
+
+resume_pair_fixture="$(make_fixture resume-retained-pair-mismatch)"
+prepare_committed_fixture "${resume_pair_fixture}"
+resume_pair_post="${resume_pair_fixture}/.private/terraform-bootstrap/post-migration-20260827T120000Z-200.tfstate"
+jq -c '.outputs.fixture.value = "changed"' \
+  "${resume_pair_post}" >"${resume_pair_post}.changed"
+mv "${resume_pair_post}.changed" "${resume_pair_post}"
+cp "${resume_pair_post}" \
+  "${resume_pair_fixture}/remote-store/bootstrap/terraform.tfstate"
+chmod 600 \
+  "${resume_pair_post}" \
+  "${resume_pair_fixture}/remote-store/bootstrap/terraform.tfstate"
+capture_resume_files "${resume_pair_fixture}"
+resume_pair_error="${resume_pair_fixture}/migration-error.txt"
+if PATH="${resume_pair_fixture}/bin:${PATH}" \
+  FAKE_LOG="${resume_pair_fixture}/commands.log" \
+  "${resume_pair_fixture}/infra/bootstrap/scripts/migrate-state.sh" \
+  --resume-verification >/dev/null 2>"${resume_pair_error}"; then
+  echo "Resume verification unexpectedly accepted a mismatched retained pair." >&2
+  exit 1
+fi
+assert_expected_failure_output \
+  "resume-retained-pair-mismatch" \
+  "${resume_pair_error}" \
+  "Retained post-migration state differs from the retained pre-migration state."
+assert_resume_preserved_state "${resume_pair_fixture}"
+record_negative_case "resume-retained-pair-mismatch"
+
+for resume_plan_exit in 1 2; do
+  resume_plan_fixture="$(make_fixture "resume-plan-exit-${resume_plan_exit}")"
+  prepare_committed_fixture "${resume_plan_fixture}"
+  capture_resume_files "${resume_plan_fixture}"
+  resume_plan_error="${resume_plan_fixture}/migration-error.txt"
+  if PATH="${resume_plan_fixture}/bin:${PATH}" \
+    FAKE_LOG="${resume_plan_fixture}/commands.log" \
+    FAKE_PLAN_EXIT_CODE="${resume_plan_exit}" \
+    "${resume_plan_fixture}/infra/bootstrap/scripts/migrate-state.sh" \
+    --resume-verification >/dev/null 2>"${resume_plan_error}"; then
+    printf 'Resume verification unexpectedly accepted plan exit %s.\n' \
+      "${resume_plan_exit}" >&2
+    exit 1
+  fi
+  if [[ "${resume_plan_exit}" == "2" ]]; then
+    resume_plan_diagnostic="The post-migration plan contains changes; migration verification failed."
+  else
+    resume_plan_diagnostic="The post-migration plan could not complete."
+  fi
+  assert_expected_failure_output \
+    "resume-plan-exit-${resume_plan_exit}" \
+    "${resume_plan_error}" \
+    "${resume_plan_diagnostic}"
+  assert_resume_preserved_state "${resume_plan_fixture}"
+  record_negative_case "resume-plan-exit-${resume_plan_exit}"
+done
+
+resume_lock_fixture="$(make_fixture resume-residual-lock)"
+prepare_committed_fixture "${resume_lock_fixture}"
+capture_resume_files "${resume_lock_fixture}"
+resume_lock_error="${resume_lock_fixture}/migration-error.txt"
+if PATH="${resume_lock_fixture}/bin:${PATH}" \
+  FAKE_LOG="${resume_lock_fixture}/commands.log" \
+  FAKE_RESIDUAL_LOCK=true \
+  "${resume_lock_fixture}/infra/bootstrap/scripts/migrate-state.sh" \
+  --resume-verification >/dev/null 2>"${resume_lock_error}"; then
+  echo "Resume verification unexpectedly accepted a residual state lock." >&2
+  exit 1
+fi
+assert_expected_failure_output \
+  "resume-residual-lock" \
+  "${resume_lock_error}" \
+  "The post-migration plan left a Terraform state lock object behind."
+assert_resume_preserved_state "${resume_lock_fixture}"
+test -e "${resume_lock_fixture}/remote-store/bootstrap/terraform.tfstate.tflock"
+record_negative_case "resume-residual-lock"
 
 lock_fixture="$(make_fixture residual-lock)"
 lock_error="${lock_fixture}/migration-error.txt"
