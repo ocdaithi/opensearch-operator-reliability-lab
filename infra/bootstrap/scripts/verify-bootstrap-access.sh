@@ -46,7 +46,7 @@ human_inline_name="opensearch-lab-bootstrap-management"
 github_inline_name="opensearch-lab-bootstrap-state"
 budget_name="opensearch-lab-monthly-cost"
 github_subject="repo:ocdaithi@321047870/opensearch-operator-reliability-lab@1346323330:environment:aws-bootstrap"
-temporary_template_digest="e019c844afe18cb9b345734d83b54ce14a96d60061d36bf1e4675a29aa979829"
+temporary_template_digest="8bde0769132eb0bb831c83a5c02a6773e585d989af56d174a28dc7a707a61a1a"
 human_boundary_template_digest="c8592acc57fea897687b8b9b12cba677d9411f47b5c92280c3576f57846ff906"
 github_boundary_template_digest="21a1c3d24734eceb43fa2b0dd69f0748a89e480b5e20fcb41dd04ffa72e6f8b7"
 
@@ -112,7 +112,7 @@ has_reviewed_static_policy_contracts() {
         .Condition.ArnEquals["aws:PrincipalArn"]
           == "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
         and .Condition.ArnLike["aws:SignInSessionArn"]
-          == "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+          == "arn:aws:signin:*:__AWS_ACCOUNT_ID__:session/*"
         and .Condition.DateLessThan["aws:CurrentTime"]
           == "__TEMPORARY_POLICY_EXPIRY_UTC__"
       )
@@ -238,7 +238,8 @@ fi
 if [[ "${verification_phase}" == "--before-removal" ]]; then
   if ! temporary_expiry="$(jq -er \
     --arg billing_view_arn "arn:aws:billing::${account_id}:billingview/primary" \
-    --arg principal_arn "arn:aws:iam::${account_id}:user/${bootstrap_user_name}" '
+    --arg principal_arn "arn:aws:iam::${account_id}:user/${bootstrap_user_name}" \
+    --arg sign_in_session_arn "arn:aws:signin:*:${account_id}:session/*" '
     . as $policy
     | [.Statement[] | select(.Effect == "Allow")] as $allows
     | [$allows[] | select(.Sid == "ReadDefaultBillingViewData")] as $billing_statements
@@ -250,7 +251,7 @@ if [[ "${verification_phase}" == "--before-removal" ]]; then
     | select(all($allows[];
         .Condition.ArnEquals["aws:PrincipalArn"] == $principal_arn
         and .Condition.ArnLike["aws:SignInSessionArn"]
-          == "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+          == $sign_in_session_arn
       ))
     | select(($billing_statements | length) == 1)
     | select($billing_statements[0].Action == "billing:GetBillingViewData")

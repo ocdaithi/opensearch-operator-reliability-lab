@@ -14,7 +14,7 @@
           "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
         },
         "ArnLike": {
-          "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+          "aws:SignInSessionArn": "arn:aws:signin:*:__AWS_ACCOUNT_ID__:session/*"
         },
         "DateLessThan": {
           "aws:CurrentTime": "__TEMPORARY_POLICY_EXPIRY_UTC__"
@@ -56,7 +56,7 @@
           "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
         },
         "ArnLike": {
-          "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+          "aws:SignInSessionArn": "arn:aws:signin:*:__AWS_ACCOUNT_ID__:session/*"
         },
         "DateLessThan": {
           "aws:CurrentTime": "__TEMPORARY_POLICY_EXPIRY_UTC__"
@@ -76,7 +76,7 @@
           "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
         },
         "ArnLike": {
-          "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+          "aws:SignInSessionArn": "arn:aws:signin:*:__AWS_ACCOUNT_ID__:session/*"
         },
         "DateLessThan": {
           "aws:CurrentTime": "__TEMPORARY_POLICY_EXPIRY_UTC__"
@@ -97,7 +97,7 @@
           "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
         },
         "ArnLike": {
-          "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+          "aws:SignInSessionArn": "arn:aws:signin:*:__AWS_ACCOUNT_ID__:session/*"
         },
         "DateLessThan": {
           "aws:CurrentTime": "__TEMPORARY_POLICY_EXPIRY_UTC__"
@@ -120,7 +120,7 @@
           "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
         },
         "ArnLike": {
-          "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+          "aws:SignInSessionArn": "arn:aws:signin:*:__AWS_ACCOUNT_ID__:session/*"
         },
         "DateLessThan": {
           "aws:CurrentTime": "__TEMPORARY_POLICY_EXPIRY_UTC__"
@@ -137,7 +137,7 @@
           "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
         },
         "ArnLike": {
-          "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+          "aws:SignInSessionArn": "arn:aws:signin:*:__AWS_ACCOUNT_ID__:session/*"
         },
         "DateLessThan": {
           "aws:CurrentTime": "__TEMPORARY_POLICY_EXPIRY_UTC__"
@@ -158,7 +158,7 @@
           "iam:PermissionsBoundary": "arn:aws:iam::__AWS_ACCOUNT_ID__:policy/opensearch-lab-terraform-admin-boundary"
         },
         "ArnLike": {
-          "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+          "aws:SignInSessionArn": "arn:aws:signin:*:__AWS_ACCOUNT_ID__:session/*"
         },
         "DateLessThan": {
           "aws:CurrentTime": "__TEMPORARY_POLICY_EXPIRY_UTC__"
@@ -179,7 +179,7 @@
           "iam:PermissionsBoundary": "arn:aws:iam::__AWS_ACCOUNT_ID__:policy/opensearch-lab-github-actions-boundary"
         },
         "ArnLike": {
-          "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+          "aws:SignInSessionArn": "arn:aws:signin:*:__AWS_ACCOUNT_ID__:session/*"
         },
         "DateLessThan": {
           "aws:CurrentTime": "__TEMPORARY_POLICY_EXPIRY_UTC__"
@@ -206,7 +206,7 @@
           "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
         },
         "ArnLike": {
-          "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+          "aws:SignInSessionArn": "arn:aws:signin:*:__AWS_ACCOUNT_ID__:session/*"
         },
         "DateLessThan": {
           "aws:CurrentTime": "__TEMPORARY_POLICY_EXPIRY_UTC__"
@@ -228,7 +228,7 @@
           "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
         },
         "ArnLike": {
-          "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+          "aws:SignInSessionArn": "arn:aws:signin:*:__AWS_ACCOUNT_ID__:session/*"
         },
         "DateLessThan": {
           "aws:CurrentTime": "__TEMPORARY_POLICY_EXPIRY_UTC__"
@@ -245,7 +245,7 @@
           "aws:PrincipalArn": "arn:aws:iam::__AWS_ACCOUNT_ID__:user/opensearch-lab-bootstrap"
         },
         "ArnLike": {
-          "aws:SignInSessionArn": "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+          "aws:SignInSessionArn": "arn:aws:signin:*:__AWS_ACCOUNT_ID__:session/*"
         },
         "DateLessThan": {
           "aws:CurrentTime": "__TEMPORARY_POLICY_EXPIRY_UTC__"

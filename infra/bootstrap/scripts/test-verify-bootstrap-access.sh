@@ -799,7 +799,7 @@ if ! jq -e --arg account_id "${account_id}" '
       .Condition.ArnEquals["aws:PrincipalArn"]
         == ("arn:aws:iam::" + $account_id + ":user/opensearch-lab-bootstrap")
       and .Condition.ArnLike["aws:SignInSessionArn"]
-        == "arn:aws:signin:*:${aws:PrincipalAccount}:session/*"
+        == ("arn:aws:signin:*:" + $account_id + ":session/*")
       and (.Condition.DateLessThan["aws:CurrentTime"] |
         type == "string"
         and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))

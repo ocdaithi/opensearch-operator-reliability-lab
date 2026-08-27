@@ -31,8 +31,8 @@ expiry_sentinel="__TEMPORARY_POLICY_EXPIRY_UTC__"
 account_sentinel="__AWS_ACCOUNT_ID__"
 bucket_sentinel="__STATE_BUCKET_NAME__"
 state_bucket_name="opensearch-lab-tfstate-ocdaithi-1346323330-eu-west-1"
-sign_in_pattern="arn:aws:signin:*:\${aws:PrincipalAccount}:session/*"
-reviewed_template_digest="e019c844afe18cb9b345734d83b54ce14a96d60061d36bf1e4675a29aa979829"
+sign_in_pattern="arn:aws:signin:*:${account_sentinel}:session/*"
+reviewed_template_digest="8bde0769132eb0bb831c83a5c02a6773e585d989af56d174a28dc7a707a61a1a"
 
 if [[ ! -x "${contract_digest_script}" ]]; then
   echo "The policy-contract digest helper is unavailable." >&2
