@@ -1,5 +1,6 @@
 mock_provider "aws" {
   alias = "setup"
+  override_during = plan
 
   mock_resource "aws_s3_bucket" {
     defaults = {
