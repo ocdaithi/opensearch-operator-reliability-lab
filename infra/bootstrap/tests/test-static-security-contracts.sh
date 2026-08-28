@@ -211,6 +211,11 @@ if ! has_private_budget_email_input; then
   exit 1
 fi
 
+if [[ "$(grep -Ec '^[[:space:]]*subscriber_email_addresses[[:space:]]*=[[:space:]]*\[var\.budget_notification_email\][[:space:]]*$' "$budget_file" || true)" -ne 2 ]]; then
+  printf 'Every budget notification source must use the exact private email input.\n' >&2
+  exit 1
+fi
+
 if jq -e '
   any(
     .attributes[];

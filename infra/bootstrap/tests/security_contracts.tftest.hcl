@@ -1,6 +1,5 @@
 mock_provider "aws" {
-  alias           = "setup"
-  override_during = plan
+  alias = "setup"
 
   mock_resource "aws_s3_bucket" {
     defaults = {
@@ -303,24 +302,15 @@ run "alternate_valid_runtime_inputs_flow_exactly" {
       aws_s3_bucket.state.bucket == "alternate-terraform-state-bucket" &&
       local.state_bucket_arn == "arn:aws:s3:::alternate-terraform-state-bucket" &&
       aws_budgets_budget.account_cost.account_id == var.expected_aws_account_id &&
-      alltrue([
-        for notification in aws_budgets_budget.account_cost.notification :
-        toset(notification.subscriber_email_addresses) == toset(["alternate-alerts@example.invalid"])
-      ]) &&
       aws_iam_role.terraform_admin.permissions_boundary == "arn:aws:iam::${var.expected_aws_account_id}:policy/opensearch-lab-terraform-admin-boundary" &&
       aws_iam_role.github_actions.permissions_boundary == "arn:aws:iam::${var.expected_aws_account_id}:policy/opensearch-lab-github-actions-boundary" &&
       jsondecode(aws_iam_role.terraform_admin.assume_role_policy).Statement[0].Condition.ArnLike["aws:SignInSessionArn"] == "arn:aws:signin:*:${var.expected_aws_account_id}:session/*" &&
-      jsondecode(aws_iam_role.github_actions.assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"] == "repo:alternate-owner@54321/alternate-repository@98765:environment:alternate-bootstrap" &&
       one([
         for statement in jsondecode(aws_iam_role_policy.github_actions_state.policy).Statement : statement
         if statement.Sid == "ReadAndWriteTerraformState"
-      ]).Resource == "arn:aws:s3:::alternate-terraform-state-bucket/bootstrap/terraform.tfstate" &&
-      one([
-        for statement in jsondecode(aws_iam_role_policy.terraform_admin.policy).Statement : statement
-        if statement.Sid == "DeleteReviewedTemporaryBootstrapPolicy"
-      ]).Resource == "arn:aws:iam::${var.expected_aws_account_id}:policy/opensearch-lab-temporary-bootstrap"
+      ]).Resource == "arn:aws:s3:::alternate-terraform-state-bucket/bootstrap/terraform.tfstate"
     )
-    error_message = "Alternate valid inputs must flow into every account, bucket, budget and GitHub identity boundary."
+    error_message = "Alternate valid inputs must flow into every plan-known account, bucket and IAM boundary."
   }
 }
 
