@@ -1,90 +1,65 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (($# != 0)); then
-  echo "This command does not accept arguments." >&2
+if (($# != 4)); then
+  echo "Usage: $0 <aws-account-id> <state-bucket-name> <terraform-admin-output> <github-actions-output>" >&2
   exit 1
 fi
 
-for command_name in git jq link mktemp; do
+for command_name in jq link mktemp; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "Required command is unavailable: ${command_name}" >&2
     exit 1
   fi
 done
 
-account_id="${AWS_ACCOUNT_ID:-}"
+account_id="$1"
+state_bucket_name="$2"
+terraform_admin_output="$3"
+github_actions_output="$4"
+
 if [[ ! "${account_id}" =~ ^[0-9]{12}$ ]]; then
-  echo "AWS_ACCOUNT_ID must contain exactly 12 digits." >&2
+  echo "AWS account ID must contain exactly 12 digits." >&2
   exit 1
 fi
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repository_root="$(git -C "${script_dir}" rev-parse --show-toplevel)"
-contract_digest_script="${script_dir}/policy-contract-digest.sh"
-policy_dir="${repository_root}/infra/bootstrap/policies"
-private_dir="${repository_root}/.private/terraform-bootstrap"
-human_destination="${private_dir}/terraform-admin-boundary.json"
-github_destination="${private_dir}/github-actions-boundary.json"
-lock_directory="${private_dir}/.generate-permissions-boundaries.lock"
-partition="aws"
-state_bucket_name="opensearch-lab-tfstate-ocdaithi-1346323330-eu-west-1"
-billing_view_arn="arn:${partition}:billing::${account_id}:billingview/primary"
-human_template_digest="c8592acc57fea897687b8b9b12cba677d9411f47b5c92280c3576f57846ff906"
-github_template_digest="21a1c3d24734eceb43fa2b0dd69f0748a89e480b5e20fcb41dd04ffa72e6f8b7"
+valid_bucket_name() {
+  local bucket_name="$1"
 
-if [[ ! -x "${contract_digest_script}" ]]; then
-  echo "The policy-contract digest helper is unavailable." >&2
-  exit 1
-fi
-if [[ "$("${contract_digest_script}" "${policy_dir}/terraform-admin-boundary.template.json")" != \
-  "${human_template_digest}" ]] || \
-  [[ "$("${contract_digest_script}" "${policy_dir}/github-actions-boundary.template.json")" != \
-  "${github_template_digest}" ]]; then
-  echo "A permissions-boundary template differs from its exact reviewed contract." >&2
-  exit 1
-fi
-
-mkdir -p "${private_dir}"
-chmod 700 "${private_dir}"
-umask 077
-
-human_temporary=""
-github_temporary=""
-lock_owned=false
-
-cleanup() {
-  local exit_status="$?"
-
-  trap - EXIT HUP INT TERM
-
-  if [[ -n "${human_temporary}" ]]; then
-    rm -f -- "${human_temporary}"
-  fi
-  if [[ -n "${github_temporary}" ]]; then
-    rm -f -- "${github_temporary}"
-  fi
-  if [[ "${lock_owned}" == true ]]; then
-    rmdir "${lock_directory}" >/dev/null 2>&1 || true
-  fi
-
-  exit "${exit_status}"
+  ((${#bucket_name} >= 3 && ${#bucket_name} <= 63)) &&
+    [[ "${bucket_name}" =~ ^[a-z0-9][a-z0-9.-]*[a-z0-9]$ ]] &&
+    [[ "${bucket_name}" != *..* && "${bucket_name}" != *.-* && "${bucket_name}" != *-.* ]] &&
+    [[ ! "${bucket_name}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] &&
+    [[ "${bucket_name}" != xn--* && "${bucket_name}" != sthree-* ]] &&
+    [[ "${bucket_name}" != amzn-s3-demo-* && "${bucket_name}" != *-s3alias ]] &&
+    [[ "${bucket_name}" != *--ol-s3 && "${bucket_name}" != *.mrap ]] &&
+    [[ "${bucket_name}" != *--x-s3 && "${bucket_name}" != *--table-s3 ]]
 }
 
-trap cleanup EXIT
-trap 'exit 1' HUP INT TERM
-
-if ! mkdir "${lock_directory}" 2>/dev/null; then
-  echo "Another permissions-boundary generation is active or its lock remains." >&2
+if ! valid_bucket_name "${state_bucket_name}"; then
+  echo "State bucket name is not a valid exact S3 bucket name." >&2
   exit 1
 fi
-lock_owned=true
+if [[ "${terraform_admin_output}" == "${github_actions_output}" ]]; then
+  echo "Permissions boundaries require two distinct output paths." >&2
+  exit 1
+fi
 
-destination_must_not_exist() {
+validate_destination() {
   local destination="$1"
+  local parent_directory
 
-  if [[ -e "${destination}" || -L "${destination}" ]]; then
+  if [[ -L "${destination}" ]]; then
+    echo "Refusing symlink destination: ${destination}" >&2
+    return 1
+  fi
+  if [[ -e "${destination}" ]]; then
     echo "Refusing to overwrite existing destination: ${destination}" >&2
+    return 1
+  fi
+  parent_directory="$(dirname -- "${destination}")"
+  if [[ ! -d "${parent_directory}" ]]; then
+    echo "Output directory does not exist: ${parent_directory}" >&2
     return 1
   fi
 }
@@ -99,107 +74,168 @@ publish_exclusively() {
   fi
 }
 
-destination_must_not_exist "${human_destination}"
-destination_must_not_exist "${github_destination}"
+validate_destination "${terraform_admin_output}"
+validate_destination "${github_actions_output}"
 
-human_temporary="$(mktemp "${private_dir}/.terraform-admin-boundary.json.XXXXXX")"
-github_temporary="$(mktemp "${private_dir}/.github-actions-boundary.json.XXXXXX")"
+script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+terraform_admin_template="${script_directory}/../policies/terraform-admin-boundary.template.json"
+github_actions_template="${script_directory}/../policies/github-actions-boundary.template.json"
+for template_file in "${terraform_admin_template}" "${github_actions_template}"; do
+  if [[ ! -r "${template_file}" || ! -f "${template_file}" ]]; then
+    echo "Policy template is unavailable: ${template_file}" >&2
+    exit 1
+  fi
+done
 
-resolve_template() {
+umask 077
+terraform_admin_temporary=""
+github_actions_temporary=""
+cleanup() {
+  local exit_status="$?"
+
+  trap - EXIT HUP INT TERM
+  [[ -z "${terraform_admin_temporary}" ]] || rm -f -- "${terraform_admin_temporary}"
+  [[ -z "${github_actions_temporary}" ]] || rm -f -- "${github_actions_temporary}"
+  exit "${exit_status}"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+terraform_admin_temporary="$(mktemp "${terraform_admin_output}.tmp.XXXXXX")"
+github_actions_temporary="$(mktemp "${github_actions_output}.tmp.XXXXXX")"
+
+render_template() {
   local template_file="$1"
-  local output_file="$2"
+  local resolved_file="$2"
 
   jq -ce \
     --arg account_id "${account_id}" \
-    --arg partition "${partition}" \
-    --arg state_bucket_name "${state_bucket_name}" '
+    --arg bucket "${state_bucket_name}" '
       walk(
         if type == "string" then
           gsub("__AWS_ACCOUNT_ID__"; $account_id)
-          | gsub("__AWS_PARTITION__"; $partition)
-          | gsub("__STATE_BUCKET_NAME__"; $state_bucket_name)
-        else
-          .
-        end
+          | gsub("__AWS_PARTITION__"; "aws")
+          | gsub("__STATE_BUCKET_NAME__"; $bucket)
+        else . end
       )
-    ' "${template_file}" >"${output_file}"
+    ' "${template_file}" >"${resolved_file}"
+
+  if grep -Eq '__[A-Z0-9_]+__' "${resolved_file}"; then
+    echo "Resolved policy still contains a template placeholder." >&2
+    return 1
+  fi
+  if ! jq -e 'type == "object"' "${resolved_file}" >/dev/null; then
+    echo "Resolved policy is not valid JSON." >&2
+    return 1
+  fi
 }
 
-resolve_template \
-  "${policy_dir}/terraform-admin-boundary.template.json" \
-  "${human_temporary}"
-resolve_template \
-  "${policy_dir}/github-actions-boundary.template.json" \
-  "${github_temporary}"
+render_template "${terraform_admin_template}" "${terraform_admin_temporary}"
+render_template "${github_actions_template}" "${github_actions_temporary}"
 
-for resolved_file in "${human_temporary}" "${github_temporary}"; do
-  if ! jq -e '
-    [.. | strings | select(contains("__"))] | length == 0
-  ' "${resolved_file}" >/dev/null; then
-    echo "A resolved permissions boundary still contains a template sentinel." >&2
+validate_boundary() {
+  local resolved_file="$1"
+  local policy_name="$2"
+
+  if ! jq -e \
+    --arg account_id "${account_id}" \
+    --arg bucket "${state_bucket_name}" '
+      def list: if type == "array" then . else [.] end;
+      def actions: [.Statement[] | .Action | list[]];
+      def resources: [.Statement[] | .Resource | list[]];
+      [
+        "billing:GetBillingViewData",
+        "budgets:ListTagsForResource", "budgets:ModifyBudget",
+        "budgets:TagResource", "budgets:UntagResource", "budgets:ViewBudget",
+        "iam:DeletePolicy", "iam:DetachUserPolicy", "iam:GetOpenIDConnectProvider",
+        "iam:GetPolicy", "iam:GetPolicyVersion", "iam:GetRole", "iam:GetRolePolicy",
+        "iam:GetUser", "iam:ListAccessKeys", "iam:ListAttachedRolePolicies",
+        "iam:ListAttachedUserPolicies", "iam:ListEntitiesForPolicy",
+        "iam:ListGroupsForUser", "iam:ListMFADevices",
+        "iam:ListOpenIDConnectProviderTags", "iam:ListRolePolicies",
+        "iam:ListRoleTags", "iam:ListUserPolicies",
+        "s3:DeleteObject", "s3:GetAccelerateConfiguration", "s3:GetBucketAcl",
+        "s3:GetBucketCORS", "s3:GetBucketLocation", "s3:GetBucketLogging",
+        "s3:GetBucketObjectLockConfiguration", "s3:GetBucketOwnershipControls",
+        "s3:GetBucketPolicy", "s3:GetBucketPublicAccessBlock",
+        "s3:GetBucketRequestPayment", "s3:GetBucketVersioning",
+        "s3:GetBucketWebsite", "s3:GetEncryptionConfiguration", "s3:GetLifecycleConfiguration",
+        "s3:GetObject", "s3:GetReplicationConfiguration", "s3:ListBucket",
+        "s3:ListTagsForResource", "s3:PutBucketOwnershipControls",
+        "s3:PutBucketPublicAccessBlock", "s3:PutBucketVersioning",
+        "s3:PutEncryptionConfiguration", "s3:PutLifecycleConfiguration",
+        "s3:PutObject", "s3:TagResource", "s3:UntagResource"
+      ] as $allowed_actions
+      | . as $policy
+      | ($policy | actions) as $actions
+      | ($policy | resources) as $resources
+      | ("arn:aws:s3:::" + $bucket) as $bucket_arn
+      | $policy.Version == "2012-10-17"
+        and ($policy.Statement | type == "array" and length > 0)
+        and all($policy.Statement[]; .Effect == "Allow")
+        and all($policy.Statement[]; has("Action") and has("Resource"))
+        and ([.. | objects | select(has("NotAction") or has("NotResource"))] | length == 0)
+        and ($actions - $allowed_actions | length) == 0
+        and all($actions[]; type == "string" and (contains("*") | not))
+        and all($resources[]; type == "string" and (contains("*") | not))
+        and all(
+          $resources[];
+          if startswith("arn:aws:s3:::") then
+            . == $bucket_arn
+            or . == ($bucket_arn + "/bootstrap/terraform.tfstate")
+            or . == ($bucket_arn + "/bootstrap/terraform.tfstate.tflock")
+          elif startswith("arn:aws:iam::") then
+            startswith("arn:aws:iam::" + $account_id + ":")
+          elif startswith("arn:aws:budgets::") then
+            startswith("arn:aws:budgets::" + $account_id + ":")
+          elif startswith("arn:aws:billing::") then
+            startswith("arn:aws:billing::" + $account_id + ":")
+          else false end
+        )
+        and all(
+          $policy.Statement[];
+          ([.Resource | list[] | select(endswith("-boundary"))] | length) == 0
+          or all(.Action | list[]; . == "iam:GetPolicy" or . == "iam:GetPolicyVersion")
+        )
+        and ($actions | index("iam:AttachUserPolicy")) == null
+        and ($actions | index("iam:PutUserPermissionsBoundary")) == null
+        and ($actions | index("iam:PutRolePermissionsBoundary")) == null
+        and ([
+          .. | objects | select(has("s3:prefix")) | .["s3:prefix"] | list[]
+          | select(. != "bootstrap/terraform.tfstate"
+            and . != "bootstrap/terraform.tfstate.tflock")
+        ] | length) == 0
+    ' "${resolved_file}" >/dev/null; then
+    echo "${policy_name} failed its security contract." >&2
+    return 1
+  fi
+}
+
+validate_boundary "${terraform_admin_temporary}" "Terraform administration boundary"
+validate_boundary "${github_actions_temporary}" "GitHub Actions boundary"
+
+file_mode() {
+  if stat -f '%Lp' "$1" >/dev/null 2>&1; then
+    stat -f '%Lp' "$1"
+  else
+    stat -c '%a' "$1"
+  fi
+}
+
+for resolved_file in "${terraform_admin_temporary}" "${github_actions_temporary}"; do
+  if (($(wc -c <"${resolved_file}") > 6144)); then
+    echo "Resolved permissions boundary exceeds the IAM managed-policy size limit." >&2
     exit 1
   fi
-
-  if ! jq -e '
-    all(.Statement[]; .Effect == "Allow")
-    and ([.. | objects | select(has("NotAction") or has("NotResource"))] | length == 0)
-  ' "${resolved_file}" >/dev/null; then
-    echo "A permissions boundary contains an unsupported policy form." >&2
+  chmod 0600 "${resolved_file}"
+  if [[ "$(file_mode "${resolved_file}")" != "600" ]]; then
+    echo "Resolved permissions boundary does not have mode 0600." >&2
     exit 1
   fi
-
-  if ! jq -e '
-    def actions: .Action | if type == "array" then . else [.] end;
-    def forbidden_boundary_mutations: [
-      "iam:AttachRolePolicy",
-      "iam:AttachUserPolicy",
-      "iam:CreatePolicy",
-      "iam:CreatePolicyVersion",
-      "iam:DeletePolicyVersion",
-      "iam:DeleteRolePermissionsBoundary",
-      "iam:DeleteUserPermissionsBoundary",
-      "iam:DetachRolePolicy",
-      "iam:PutRolePermissionsBoundary",
-      "iam:PutUserPermissionsBoundary",
-      "iam:SetDefaultPolicyVersion",
-      "iam:TagPolicy",
-      "iam:UntagPolicy"
-    ];
-    ([.Statement[] | actions[]] - forbidden_boundary_mutations | length)
-      == ([.Statement[] | actions[]] | length)
-    and ([
-      .Statement[]
-      | select((.Resource | tojson | contains("-boundary")))
-      | actions[]
-      | select(. != "iam:GetPolicy" and . != "iam:GetPolicyVersion")
-    ] | length == 0)
-  ' "${resolved_file}" >/dev/null; then
-    echo "A boundary policy permits mutation of a permissions boundary." >&2
-    exit 1
-  fi
-
-  compact_size="$(wc -c <"${resolved_file}" | tr -d '[:space:]')"
-  if ((compact_size > 6144)); then
-    echo "A resolved permissions boundary exceeds the managed-policy size limit." >&2
-    exit 1
-  fi
-  chmod 600 "${resolved_file}"
 done
 
-if ! jq -e --arg billing_view_arn "${billing_view_arn}" '
-  [.Statement[] | select(.Sid == "ReadDefaultBillingViewData")]
-  | length == 1
-    and .[0].Action == "billing:GetBillingViewData"
-    and .[0].Resource == $billing_view_arn
-' "${human_temporary}" >/dev/null; then
-  echo "The Terraform administration boundary failed its billing-view invariant." >&2
-  exit 1
-fi
-
-destination_must_not_exist "${human_destination}"
-destination_must_not_exist "${github_destination}"
-
-publish_exclusively "${human_temporary}" "${human_destination}"
-publish_exclusively "${github_temporary}" "${github_destination}"
-
-echo "Permissions boundaries generated in the private bootstrap directory."
+validate_destination "${terraform_admin_output}"
+validate_destination "${github_actions_output}"
+publish_exclusively "${terraform_admin_temporary}" "${terraform_admin_output}"
+publish_exclusively "${github_actions_temporary}" "${github_actions_output}"
+echo "Permissions boundaries written with mode 0600."

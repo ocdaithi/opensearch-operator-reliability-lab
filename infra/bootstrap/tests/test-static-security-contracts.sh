@@ -2,9 +2,12 @@
 set -euo pipefail
 
 bootstrap_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+backend_example_file="$bootstrap_dir/backend.s3.tf.example"
 budget_file="$bootstrap_dir/budget.tf"
+provider_file="$bootstrap_dir/providers.tf"
 state_file="$bootstrap_dir/state.tf"
 structure_inspector="$bootstrap_dir/tests/inspect-hcl-structure.py"
+variables_file="$bootstrap_dir/variables.tf"
 shopt -s nullglob
 
 for command_name in jq python3; do
@@ -25,6 +28,13 @@ if ((${#json_configuration[@]} != 0)); then
   exit 1
 fi
 
+expected_backend_example=$'terraform {\n  backend "s3" {}\n}'
+if [[ ! -f "$backend_example_file" ]] || [[ -L "$backend_example_file" ]] ||
+  [[ "$(<"$backend_example_file")" != "$expected_backend_example" ]]; then
+  printf 'The partial S3 backend example must contain no credential, profile or role-assumption configuration.\n' >&2
+  exit 1
+fi
+
 expected_resources="$(printf '%s\n' \
   aws_budgets_budget.account_cost \
   aws_iam_openid_connect_provider.github \
@@ -40,7 +50,14 @@ expected_resources="$(printf '%s\n' \
   aws_s3_bucket_server_side_encryption_configuration.state \
   aws_s3_bucket_versioning.state | sort)"
 
-if ! structure="$(python3 "$structure_inspector" "$bootstrap_dir"/*.tf)"; then
+terraform_configuration=()
+for configuration_file in "$bootstrap_dir"/*.tf; do
+  if [[ "$(basename "$configuration_file")" != "backend.tf" ]]; then
+    terraform_configuration+=("$configuration_file")
+  fi
+done
+
+if ! structure="$(python3 "$structure_inspector" "${terraform_configuration[@]}")"; then
   printf 'Unable to inspect the bootstrap HCL structure.\n' >&2
   exit 1
 fi
@@ -66,6 +83,131 @@ fi
 
 if [[ "$(jq '.ignore_changes | length' <<<"$structure")" -ne 0 ]]; then
   printf 'Bootstrap resources must not use ignore_changes.\n' >&2
+  exit 1
+fi
+
+if jq -e '
+  any(
+    .blocks[];
+    .resource == null and
+      .parents[0] == "provider" and
+      ((.parents == ["provider"] and .type == "default_tags") | not)
+  ) or
+  any(
+    .attributes[];
+    .resource == null and
+      .parents[0] == "provider" and
+      ((
+        (.parents == ["provider"] and
+          (.name | IN("allowed_account_ids", "region"))) or
+        (.parents == ["provider", "default_tags"] and .name == "tags")
+      ) | not)
+  )
+' <<<"$structure" >/dev/null; then
+  printf 'The AWS provider must use only the exact ambient-credential configuration.\n' >&2
+  exit 1
+fi
+
+has_exact_provider_inputs() {
+  awk '
+    /^[[:space:]]*provider[[:space:]]+"aws"[[:space:]]*\{[[:space:]]*$/ {
+      inside = 1
+      depth = 1
+      seen++
+      next
+    }
+
+    inside {
+      if ($0 ~ /^[[:space:]]*allowed_account_ids[[:space:]]*=/) {
+        account_assignments++
+        assignment = $0
+        sub(/^[[:space:]]+/, "", assignment)
+        if (assignment ~ /^allowed_account_ids[[:space:]]*=[[:space:]]*\[var\.expected_aws_account_id\]$/) {
+          exact_account = 1
+        }
+      }
+      if ($0 ~ /^[[:space:]]*region[[:space:]]*=/) {
+        region_assignments++
+        assignment = $0
+        sub(/^[[:space:]]+/, "", assignment)
+        if (assignment ~ /^region[[:space:]]*=[[:space:]]*var\.aws_region$/) {
+          exact_region = 1
+        }
+      }
+
+      line = $0
+      opens = gsub(/{/, "{", line)
+      line = $0
+      closes = gsub(/}/, "}", line)
+      depth += opens - closes
+      if (depth == 0) {
+        inside = 0
+      }
+    }
+
+    END {
+      exit !(seen == 1 && account_assignments == 1 && exact_account &&
+        region_assignments == 1 && exact_region)
+    }
+  ' "$provider_file"
+}
+
+if ! has_exact_provider_inputs; then
+  printf 'The AWS provider must use the exact region and expected account inputs.\n' >&2
+  exit 1
+fi
+
+if jq -e '
+  any(
+    .attributes[];
+    .parents == ["variable"] and
+      .parent_labels == [["budget_notification_email"]] and
+      .name == "default"
+  )
+' <<<"$structure" >/dev/null; then
+  printf 'The budget notification email must be sensitive and have no tracked default.\n' >&2
+  exit 1
+fi
+
+has_private_budget_email_input() {
+  awk '
+    /^[[:space:]]*variable[[:space:]]+"budget_notification_email"[[:space:]]*\{[[:space:]]*$/ {
+      inside = 1
+      depth = 1
+      seen++
+      next
+    }
+
+    inside {
+      if (depth == 1 && $0 ~ /^[[:space:]]*type[[:space:]]*=[[:space:]]*string[[:space:]]*$/) {
+        type_assignments++
+      }
+      if (depth == 1 && $0 ~ /^[[:space:]]*sensitive[[:space:]]*=[[:space:]]*true[[:space:]]*$/) {
+        sensitive_assignments++
+      }
+      if (depth == 1 && $0 ~ /^[[:space:]]*default[[:space:]]*=/) {
+        default_assignments++
+      }
+
+      line = $0
+      opens = gsub(/{/, "{", line)
+      line = $0
+      closes = gsub(/}/, "}", line)
+      depth += opens - closes
+      if (depth == 0) {
+        inside = 0
+      }
+    }
+
+    END {
+      exit !(seen == 1 && type_assignments == 1 &&
+        sensitive_assignments == 1 && default_assignments == 0)
+    }
+  ' "$variables_file"
+}
+
+if ! has_private_budget_email_input; then
+  printf 'The budget notification email must be sensitive and have no tracked default.\n' >&2
   exit 1
 fi
 
@@ -357,4 +499,4 @@ for resource in "${protected_resources[@]}"; do
   fi
 done
 
-printf 'Static bootstrap contracts passed: 13 allowed resources, 2 exact role boundaries, 1 exact budget source, 1 all-object lifecycle filter, 0 modules, 0 provisioners, 0 ignore_changes rules, 8 destroy guards.\n'
+printf 'Static bootstrap contracts passed: 13 allowed resources, 2 exact role boundaries, 1 exact AWS account allow-list, 1 exact ambient provider, 1 credential-free partial backend, 1 private budget input without a default, 1 exact budget source, 1 all-object lifecycle filter, 0 modules, 0 provisioners, 0 ignore_changes rules, 8 destroy guards.\n'

@@ -1,11 +1,52 @@
+variable "expected_aws_account_id" {
+  description = "AWS account that Terraform is allowed to manage."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.expected_aws_account_id))
+    error_message = "The expected AWS account ID must contain exactly 12 digits."
+  }
+}
+
 variable "aws_region" {
   description = "AWS Region for the bootstrap state bucket."
   type        = string
-  default     = "eu-west-1"
 
   validation {
-    condition     = var.aws_region == "eu-west-1"
-    error_message = "The bootstrap foundation must remain in eu-west-1."
+    condition = (
+      can(regex("^[a-z]{2}(-[a-z0-9]+)+-[0-9]+$", var.aws_region)) &&
+      !startswith(var.aws_region, "cn-") &&
+      !startswith(var.aws_region, "us-gov-") &&
+      !startswith(var.aws_region, "us-iso-") &&
+      !startswith(var.aws_region, "us-isob-")
+    )
+    error_message = "The AWS Region must be a valid commercial AWS Region."
+  }
+}
+
+variable "state_bucket_name" {
+  description = "Globally unique S3 bucket name for Terraform state."
+  type        = string
+
+  validation {
+    condition = (
+      length(var.state_bucket_name) >= 3 &&
+      length(var.state_bucket_name) <= 63 &&
+      can(regex("^[a-z0-9][a-z0-9.-]*[a-z0-9]$", var.state_bucket_name)) &&
+      !strcontains(var.state_bucket_name, "..") &&
+      !strcontains(var.state_bucket_name, ".-") &&
+      !strcontains(var.state_bucket_name, "-.") &&
+      !can(regex("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$", var.state_bucket_name)) &&
+      !startswith(var.state_bucket_name, "xn--") &&
+      !startswith(var.state_bucket_name, "sthree-") &&
+      !startswith(var.state_bucket_name, "amzn-s3-demo-") &&
+      !endswith(var.state_bucket_name, "-s3alias") &&
+      !endswith(var.state_bucket_name, "--ol-s3") &&
+      !endswith(var.state_bucket_name, ".mrap") &&
+      !endswith(var.state_bucket_name, "--x-s3") &&
+      !endswith(var.state_bucket_name, "--table-s3")
+    )
+    error_message = "The state bucket name must be a valid, exact S3 bucket name."
   }
 }
 
@@ -24,18 +65,52 @@ variable "budget_notification_email" {
   }
 }
 
-variable "terraform_admin_role_arn" {
-  description = "ARN of the Terraform administration role to assume after the initial bootstrap apply."
+variable "github_owner" {
+  description = "GitHub organisation or user that owns the repository."
   type        = string
-  default     = null
-  sensitive   = true
-  nullable    = true
 
   validation {
-    condition = (
-      var.terraform_admin_role_arn == null ||
-      can(regex("^arn:[a-z0-9-]+:iam::[0-9]{12}:role/opensearch-lab-terraform-admin$", var.terraform_admin_role_arn))
-    )
-    error_message = "The Terraform administration role ARN must name opensearch-lab-terraform-admin."
+    condition     = length(var.github_owner) <= 39 && can(regex("^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$", var.github_owner))
+    error_message = "The GitHub owner must contain only letters, digits and non-edge hyphens."
+  }
+}
+
+variable "github_owner_id" {
+  description = "Immutable numeric GitHub ID for the repository owner."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[1-9][0-9]*$", var.github_owner_id))
+    error_message = "The GitHub owner ID must contain only digits and must not start with zero."
+  }
+}
+
+variable "github_repository" {
+  description = "GitHub repository name trusted for OIDC federation."
+  type        = string
+
+  validation {
+    condition     = length(var.github_repository) <= 100 && can(regex("^[A-Za-z0-9._-]+$", var.github_repository))
+    error_message = "The GitHub repository must contain only letters, digits, dots, underscores and hyphens."
+  }
+}
+
+variable "github_repository_id" {
+  description = "Immutable numeric GitHub repository ID."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[1-9][0-9]*$", var.github_repository_id))
+    error_message = "The GitHub repository ID must contain only digits and must not start with zero."
+  }
+}
+
+variable "github_environment" {
+  description = "Protected GitHub Environment trusted for OIDC federation."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$", var.github_environment))
+    error_message = "The GitHub Environment must be a 1 to 100 character name without spaces, colons or wildcards."
   }
 }

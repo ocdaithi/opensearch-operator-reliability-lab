@@ -18,6 +18,7 @@ jobs:
     env:
       AWS_EC2_METADATA_DISABLED: "true"
       AWS_ENDPOINT_URL: http://127.0.0.1:9
+      TF_DATA_DIR: ${{ runner.temp }}/terraform-data
       TF_IN_AUTOMATION: "true"
 
     steps:

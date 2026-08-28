@@ -13,7 +13,7 @@ data "aws_iam_policy_document" "terraform_admin_trust" {
       test     = "ArnLike"
       variable = "aws:SignInSessionArn"
       values = [
-        "arn:${data.aws_partition.current.partition}:signin:*:${data.aws_caller_identity.current.account_id}:session/*",
+        "arn:${data.aws_partition.current.partition}:signin:*:${var.expected_aws_account_id}:session/*",
       ]
     }
   }
@@ -60,7 +60,7 @@ data "aws_iam_policy_document" "terraform_admin" {
       "s3:TagResource",
       "s3:UntagResource",
     ]
-    resources = [aws_s3_bucket.state.arn]
+    resources = [local.state_bucket_arn]
   }
 
   statement {
@@ -163,7 +163,7 @@ data "aws_iam_policy_document" "terraform_admin" {
 }
 
 resource "aws_iam_role_policy" "terraform_admin" {
-  name   = "opensearch-lab-bootstrap-management"
+  name   = local.terraform_admin_policy_name
   role   = aws_iam_role.terraform_admin.id
   policy = data.aws_iam_policy_document.terraform_admin.json
 }

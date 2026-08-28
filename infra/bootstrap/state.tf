@@ -1,9 +1,14 @@
 resource "aws_s3_bucket" "state" {
-  bucket        = local.state_bucket_name
+  bucket        = var.state_bucket_name
   force_destroy = false
 
   lifecycle {
     prevent_destroy = true
+
+    precondition {
+      condition     = data.aws_partition.current.partition == "aws"
+      error_message = "The bootstrap policies support only the commercial AWS partition."
+    }
   }
 }
 
@@ -89,8 +94,8 @@ data "aws_iam_policy_document" "state_bucket" {
 
     actions = ["s3:*"]
     resources = [
-      aws_s3_bucket.state.arn,
-      "${aws_s3_bucket.state.arn}/*",
+      local.state_bucket_arn,
+      "${local.state_bucket_arn}/*",
     ]
 
     principals {

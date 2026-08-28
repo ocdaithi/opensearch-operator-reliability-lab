@@ -1,534 +1,955 @@
 # AWS account bootstrap
 
-This page records the verified account baseline and separates it from planned project controls.
+This is the canonical runbook for a fresh installation of the AWS account
+foundation. Use
+[Verify the Terraform-managed AWS foundation](verify-state.md) for routine
+verification. Other documents explain the design and recovery boundaries but
+do not define an alternative fresh-install command sequence.
 
-## Secure Free Plan baseline
+The fresh-install path is only for an account with no foundation state. The
+existing lab account already uses the S3 backend. Never run the local-first
+migration against that installation.
 
-The lab uses a standalone personal AWS account on the [Free Plan](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/free-tier-plans.html) with AWS Free Tier credits. [ADR 0001](../adr/0001-use-a-standalone-aws-account.md) is the canonical explanation of this account boundary. Staying outside AWS Organizations and AWS Control Tower avoids their documented immediate-expiry path; it does not extend the credits or prevent their consumption.
+Before using this branch against the existing installation, follow the
+[one-off compatibility check](verify-state.md#one-off-compatibility-check-for-the-existing-installation).
+Preserve its ignored `backend.tf` and cached backend configuration for that
+first zero-change plan.
 
-No AWS infrastructure has been provisioned.
+The account foundation is applied manually from an exact saved plan. GitHub
+Actions validates the source without AWS credentials and provides a separate
+OIDC smoke test. It does not apply this foundation.
 
-### Root identity
+## Requirements
 
-The root user has a dedicated private mailbox so root, billing and security messages remain separate from public project contact channels. It is reserved for root-only and recovery tasks, in line with [AWS root-user best practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/root-user-best-practices.html).
+Use a trusted local workstation with an accurate clock and encrypted storage.
+Run commands from the repository root in an interactive macOS zsh session. The
+required tools are:
 
-The root password is unique and securely stored to avoid credential reuse. Two independently stored MFA methods were registered and tested so one unavailable method does not remove the second sign-in path. Recovery details are current. No root access keys exist, avoiding permanent programmatic credentials with unrestricted access. Root was signed out after verification to end the privileged session.
+- Git;
+- Terraform 1.15.9, as constrained by `infra/bootstrap/versions.tf`;
+- AWS CLI 2.32.0 or later with `aws login` support;
+- `jq`;
+- GitHub CLI for the final OIDC smoke test.
 
-### Free Plan lifecycle
+This implementation targets the commercial AWS partition. The pre-Terraform
+policies and GitHub OIDC audience are not portable to AWS GovCloud, AWS China or
+other partitions without a separate design change.
 
-The Free Plan ends after six months or when the AWS Free Tier credits are exhausted, whichever occurs first. The actual credit balance and plan dates remain private.
+Use a standalone AWS account while its Free Tier credits remain active. Do not
+create or join an AWS Organization or configure AWS Control Tower during that
+period. Review the account-plan effect only after the credits are no longer
+active. A budget alert is a notification, not a spending cap, and does not stop
+resources. [Cost data and notifications can be delayed](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-best-practices.html),
+so spend may pass a threshold before the alert arrives.
 
-Account identifiers, account-specific ARNs, private contact and recovery information, MFA products and device names, credentials, and screenshots or other account-specific evidence are also deliberately excluded from this public record.
+Before starting, confirm through a root MFA session that:
 
-## Project-specific configuration
+- the root password is unique and stored securely;
+- root MFA and account recovery paths work;
+- the root user has no access keys;
+- billing and security contact details are current;
+- the account ID and selected Region are correct.
 
-No project-specific AWS resource has been configured.
+Never configure root credentials in the AWS CLI. Use root only for the manual
+prerequisites described below, then sign out.
 
-### Human and automation access
+## Inputs and fixed names
 
-Daily human access and automated trust have not been configured.
+Keep all resolved installation values in the ignored private variable file.
+The Terraform inputs are:
 
-The initial Terraform bootstrap will run locally with temporary human credentials. GitHub Actions cannot assume an AWS role until the bootstrap has created the OIDC provider and trusted role. The same bootstrap will create the Terraform backend required for routine runs. Temporary human credentials avoid creating a long-lived access key solely to establish automation.
+| Terraform variable          | Local value                   | Future GitHub name                 | Environment placement |
+| --------------------------- | ----------------------------- | ---------------------------------- | --------------------- |
+| `expected_aws_account_id`   | `<aws-account-id>`            | `TF_VAR_expected_aws_account_id`   | Secret                |
+| `aws_region`                | `<aws-region>`                | `TF_VAR_aws_region`                | Variable              |
+| `state_bucket_name`         | `<state-bucket-name>`         | `TF_VAR_state_bucket_name`         | Secret                |
+| `budget_notification_email` | `<budget-notification-email>` | `TF_VAR_budget_notification_email` | Secret                |
+| `github_owner`              | `<github-owner>`              | `TF_VAR_github_owner`              | Variable              |
+| `github_owner_id`           | Numeric owner ID              | `TF_VAR_github_owner_id`           | Secret                |
+| `github_repository`         | `<github-repository>`         | `TF_VAR_github_repository`         | Variable              |
+| `github_repository_id`      | Numeric repository ID         | `TF_VAR_github_repository_id`      | Secret                |
+| `github_environment`        | `<github-environment>`        | `TF_VAR_github_environment`        | Variable              |
 
-Routine provisioning will then move to GitHub Actions OIDC. Provisioning workflows will obtain short-lived credentials instead of storing AWS credentials in GitHub. The human access model, OIDC provider and role, Terraform backend and EKS infrastructure do not yet exist.
+The numeric GitHub IDs bind OIDC trust to immutable identities rather than
+names alone. Obtain them from the relevant GitHub account and repository, and
+keep them in the ignored variable file. The tracked example contains synthetic
+IDs only.
 
-## Bootstrap runbook
+`opensearch-lab` is the reviewed, portable security-contract prefix. Terraform
+derives the predictable user, role, policy and budget names from it. The state
+and native lock keys are fixed:
 
-Run this initial sequence from the repository root in one dedicated Bash shell. It requires Git, Terraform 1.15.9, `jq`, `less`, GitHub CLI and AWS CLI 2.32.0 or later. AWS documents both the [`aws login` profile](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sign-in.html) and the [`source_profile` role pattern](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-role.html).
+```text
+bootstrap/terraform.tfstate
+bootstrap/terraform.tfstate.tflock
+```
 
-The two AWS profiles have distinct purposes:
+Credentials, profiles and role ARNs are not Terraform inputs.
 
-| Profile | Purpose |
-| --- | --- |
-| `opensearch-lab-terraform` | The `aws login` session for the keyless, MFA-protected IAM user `opensearch-lab-bootstrap`. Initial Terraform and the S3 backend use this profile. |
-| `opensearch-lab-admin` | An AWS CLI role profile for `opensearch-lab-terraform-admin`, with `opensearch-lab-terraform` as its `source_profile`. Direct verification and temporary-policy removal use this profile. |
+## 1. Prepare the workstation and private inputs
 
-Never use `aws configure` to create access keys, `sts get-session-token`, an ambient default profile or `set -x`. Stop on any failed command, unexpected existing object, identity mismatch, plan mismatch or expired permission. An `AccessDenied` response does not prove that a resource is absent.
+Keep AWS CLI configuration and login cache data inside the ignored repository
+paths already used by this installation. Preserve these paths throughout the
+bootstrap and recovery period. In every new shell, run this setup from the
+repository root before using the AWS CLI or Terraform:
 
-### 1. Prepare private local files
-
-The commands below refuse to overwrite a previous bootstrap. If any guarded path exists, stop and establish whether this is a new bootstrap or a separately reviewed recovery before changing it.
-
-```bash
-set -euo pipefail
+```zsh
 umask 077
+test ! -L ".aws" && \
+  test ! -L ".aws/login" && \
+  test ! -L ".aws/login/cache" && \
+  mkdir -p ".aws/login/cache" && \
+  chmod 700 ".aws" ".aws/login" ".aws/login/cache" && \
+  test ! -L ".aws/config" && \
+  test ! -e ".aws/credentials" && \
+  test ! -L ".aws/credentials" && \
+  export AWS_CONFIG_FILE="$PWD/.aws/config" && \
+  export AWS_SHARED_CREDENTIALS_FILE="$PWD/.aws/credentials" && \
+  export AWS_LOGIN_CACHE_DIRECTORY="$PWD/.aws/login/cache" && \
+  export AWS_EC2_METADATA_DISABLED=true && \
+  export AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true
+```
 
-repository_root="$(git rev-parse --show-toplevel)"
-[[ "${PWD}" == "${repository_root}" ]]
-private_root="${repository_root}/.private"
-private_dir="${private_root}/terraform-bootstrap"
-module_dir="${repository_root}/infra/bootstrap"
-aws_dir="${repository_root}/.aws"
+Clear credential sources and endpoint overrides that could take precedence
+over, or redirect, the named repository-local profiles:
 
-[[ -d "${module_dir}" && ! -L "${module_dir}" ]]
-[[ -f "${module_dir}/backend.local.tf.example" && \
-  ! -L "${module_dir}/backend.local.tf.example" ]]
-[[ ! -L "${private_root}" ]]
-[[ ! -e "${private_dir}" && ! -L "${private_dir}" ]]
-[[ ! -e "${aws_dir}" && ! -L "${aws_dir}" ]]
-[[ ! -e "${module_dir}/backend.tf" && ! -L "${module_dir}/backend.tf" ]]
-
-mkdir -p "${private_dir}" "${aws_dir}/login/cache"
-[[ -d "${private_root}" && ! -L "${private_root}" && -O "${private_root}" ]]
-[[ -d "${private_dir}" && ! -L "${private_dir}" && -O "${private_dir}" ]]
-[[ -d "${aws_dir}" && ! -L "${aws_dir}" && -O "${aws_dir}" ]]
-[[ -d "${aws_dir}/login" && ! -L "${aws_dir}/login" && -O "${aws_dir}/login" ]]
-[[ -d "${aws_dir}/login/cache" && ! -L "${aws_dir}/login/cache" && \
-  -O "${aws_dir}/login/cache" ]]
-chmod 700 "${private_dir}" "${aws_dir}" "${aws_dir}/login" "${aws_dir}/login/cache"
-cp "${module_dir}/backend.local.tf.example" "${module_dir}/backend.tf"
-chmod 600 "${module_dir}/backend.tf"
-
-read -rsp 'Private budget notification email: ' BUDGET_NOTIFICATION_EMAIL
-printf '\n' >&2
-read -rsp 'Confirm private budget notification email: ' budget_email_confirmation
-printf '\n' >&2
-[[ "${BUDGET_NOTIFICATION_EMAIL}" == "${budget_email_confirmation}" ]]
-unset budget_email_confirmation
-jq -nr --arg email "${BUDGET_NOTIFICATION_EMAIL}" \
-  '$email | @json | "budget_notification_email = \(.)"' \
-  >"${private_dir}/terraform.tfvars"
-chmod 600 "${private_dir}/terraform.tfvars"
-
+```zsh
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+unset AWS_SECURITY_TOKEN AWS_CREDENTIAL_EXPIRATION
+unset AWS_WEB_IDENTITY_TOKEN_FILE AWS_ROLE_ARN AWS_ROLE_SESSION_NAME
+unset AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
+unset AWS_CONTAINER_CREDENTIALS_FULL_URI
+unset AWS_CONTAINER_AUTHORIZATION_TOKEN
+unset AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE
+unset AWS_ENDPOINT_URL AWS_ENDPOINT_URL_STS AWS_ENDPOINT_URL_S3
+unset AWS_ENDPOINT_URL_IAM AWS_ENDPOINT_URL_BUDGETS
+unset AWS_S3_ENDPOINT AWS_STS_ENDPOINT AWS_IAM_ENDPOINT
+unset AWS_BUDGETS_ENDPOINT
+unset AWS_PROFILE AWS_DEFAULT_PROFILE
+unset TF_CLI_ARGS TF_CLI_ARGS_init TF_CLI_ARGS_plan
+unset TF_CLI_ARGS_apply TF_CLI_ARGS_state TF_CLI_ARGS_show
+unset TF_CLI_ARGS_output TF_DATA_DIR TF_WORKSPACE
 unset TF_VAR_terraform_admin_role_arn
-unset TF_CLI_ARGS TF_CLI_ARGS_init TF_CLI_ARGS_plan TF_CLI_ARGS_apply
-unset TF_CLI_ARGS_show TF_CLI_ARGS_output TF_CLI_ARGS_workspace TF_CLI_ARGS_state
-unset TF_WORKSPACE TF_DATA_DIR TF_PLUGIN_CACHE_DIR
-unset TF_LOG TF_LOG_PATH TF_LOG_CORE TF_LOG_PROVIDER TF_LOG_SDK
-unset TF_LOG_SDK_PROTO TF_LOG_SDK_PROTO_DATA_DIR TF_REATTACH_PROVIDERS
-unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
-unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_ROLE_ARN AWS_ROLE_SESSION_NAME
-unset AWS_WEB_IDENTITY_TOKEN_FILE
-unset AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
-unset AWS_CONTAINER_AUTHORIZATION_TOKEN AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE
-unset AWS_ENDPOINT_URL AWS_ENDPOINT_URL_STS AWS_ENDPOINT_URL_IAM
-unset AWS_ENDPOINT_URL_S3 AWS_ENDPOINT_URL_BUDGETS
-unset AWS_REGION AWS_DEFAULT_REGION
-export AWS_EC2_METADATA_DISABLED=true
-
-[[ ! -e "${module_dir}/terraform.tfvars" && \
-  ! -L "${module_dir}/terraform.tfvars" ]]
-[[ ! -e "${module_dir}/terraform.tfvars.json" && \
-  ! -L "${module_dir}/terraform.tfvars.json" ]]
-shopt -s nullglob
-auto_variable_files=(
-  "${module_dir}"/*.auto.tfvars
-  "${module_dir}"/*.auto.tfvars.json
-)
-shopt -u nullglob
-[[ "${#auto_variable_files[@]}" == '0' ]]
-unset auto_variable_files
-
-if grep -Eq '^[[:space:]]*terraform_admin_role_arn[[:space:]]*=' \
-  "${private_dir}/terraform.tfvars"; then
-  echo 'The administration-role ARN must be absent from the initial variables.' >&2
-  exit 1
-fi
-
-"${module_dir}/scripts/check-backend-contract.sh" \
-  local "${module_dir}/backend.tf" >/dev/null
-git check-ignore -q -- "${module_dir}/backend.tf"
-git check-ignore -q -- "${private_dir}/terraform.tfvars"
-git check-ignore -q -- "${aws_dir}/config"
-
-export AWS_CONFIG_FILE="${aws_dir}/config"
-export AWS_SHARED_CREDENTIALS_FILE="${aws_dir}/credentials"
-export AWS_LOGIN_CACHE_DIRECTORY="${aws_dir}/login/cache"
 ```
 
-Keep those three AWS path variables set in every shell used for this bootstrap. They isolate the shared configuration, access-key file path and `aws login` cache under ignored repository paths. AWS CLI role profiles still use the documented assumed-role cache at `~/.aws/cli/cache`; treat that cache as private. `terraform_admin_role_arn` must remain unset for the initial apply and must not be added to the initial private tfvars.
+Do not delete or replace an existing repository-local configuration or login
+cache. The shared credentials path should remain absent because authentication
+comes from `aws login`, but retaining the path variable prevents fallback to a
+user-wide credentials file. Stop if the repository-local configuration contains
+a custom service endpoint.
 
-### 2. Generate and review both permissions boundaries
+Create the private working directory and copy the synthetic example. Stop if
+either destination already exists, including as a symlink.
 
-Enter the account ID without putting it in shell history. The generator takes no arguments and writes two mode-600 files below the ignored private directory.
+```zsh
+module_dir="infra/bootstrap"
+private_dir=".private/terraform-bootstrap"
+tfvars_file="${private_dir}/terraform.tfvars"
+plan_file="${private_dir}/account-foundation.tfplan"
 
-```bash
-read -rsp 'AWS account ID: ' AWS_ACCOUNT_ID
+test ! -L ".private" && \
+  test ! -e "${private_dir}" && \
+  test ! -L "${private_dir}" && \
+  test ! -e "${tfvars_file}" && \
+  test ! -L "${tfvars_file}" && \
+  mkdir -p "${private_dir}" && \
+  chmod 700 ".private" "${private_dir}" && \
+  cp "${module_dir}/terraform.tfvars.example" "${tfvars_file}" && \
+  chmod 600 "${tfvars_file}" && \
+  printf 'Created %s; edit every synthetic value before continuing.\n' \
+    "${tfvars_file}"
+```
+
+Replace every synthetic value. Do not add credentials, profile names or role
+ARNs. `budget_notification_email` is marked sensitive to reduce incidental CLI
+display, but its value can still appear in Terraform state and saved plans.
+
+Read the two private values needed by the policy renderers without placing them
+in shell history. They must exactly match the private variable file.
+
+```zsh
+read -rs "aws_account_id?Expected 12-digit AWS account ID: "
 printf '\n' >&2
-[[ "${AWS_ACCOUNT_ID}" =~ ^[0-9]{12}$ ]]
-export AWS_ACCOUNT_ID
-
-[[ ! -e "${private_dir}/terraform-admin-boundary.json" && \
-  ! -L "${private_dir}/terraform-admin-boundary.json" ]]
-[[ ! -e "${private_dir}/github-actions-boundary.json" && \
-  ! -L "${private_dir}/github-actions-boundary.json" ]]
-"${module_dir}/scripts/generate-permissions-boundaries.sh"
-
-jq --color-output . \
-  "${private_dir}/terraform-admin-boundary.json" | less -R
-jq --color-output . \
-  "${private_dir}/github-actions-boundary.json" | less -R
+read -rs "state_bucket_name?Exact Terraform state bucket name: "
+printf '\n' >&2
+read -r "aws_region?AWS Region from the private variable file: "
 ```
 
-Review both resolved documents locally against their tracked templates. This necessary local review shows account-specific ARNs, so do not copy its output into logs, issues or commits. Stop if either document differs from the reviewed resource and action allow-lists.
+## 2. Create the durable permissions boundaries
 
-### 3. Complete root-account prerequisites
-
-Use the AWS console with a root MFA session. Do not configure root CLI credentials. Before creating anything, prove that every exact bootstrap target below is absent:
-
-- S3 bucket `opensearch-lab-tfstate-ocdaithi-1346323330-eu-west-1`;
-- IAM roles `opensearch-lab-terraform-admin` and `opensearch-lab-github-actions`;
-- IAM OIDC provider `token.actions.githubusercontent.com`;
-- budget `opensearch-lab-monthly-cost`;
-- customer-managed policies `opensearch-lab-terraform-admin-boundary`, `opensearch-lab-github-actions-boundary` and `opensearch-lab-temporary-bootstrap`.
-
-Stop if any target exists. Do not import, adopt, overwrite, delete or repurpose it as part of this runbook.
-
-Create or verify the IAM user `opensearch-lab-bootstrap`. It must use the root IAM path `/`, because an IAM path forms part of the [user ARN](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference-arns.html) and the policies bind access to `arn:aws:iam::<ACCOUNT_ID>:user/opensearch-lab-bootstrap`. A user on any other path has a different ARN and cannot use these policies. It must have console sign-in and a live MFA device, no access keys, no group membership, no inline policy and no user permissions boundary. At this point its only attached policy must be the AWS-managed `SignInLocalDevelopmentAccess` policy required by `aws login`.
-
-Create the following customer-managed policies from the two private documents, preserving the exact names and contents:
-
-- `opensearch-lab-terraform-admin-boundary` from `.private/terraform-bootstrap/terraform-admin-boundary.json`;
-- `opensearch-lab-github-actions-boundary` from `.private/terraform-bootstrap/github-actions-boundary.json`.
-
-These two boundary policies are durable root-created prerequisites. They are not Terraform resources, must not be attached to the bootstrap user and must remain after temporary-policy cleanup. Keep the two resolved private documents because both verifier phases compare them with the tracked templates and live policies.
-
-In GitHub, create the Environment `aws-bootstrap`, choose `Selected branches and tags`, add only the branch rule `main` and add no tag rule. Confirm that forks and other untrusted pull request code cannot receive its secrets. Do not add the role secret yet because the role does not exist. GitHub documents that an [environment subject contains the environment rather than a branch](https://docs.github.com/en/actions/reference/security/oidc#example-subject-claims), so the [Environment deployment-branch rule](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments#deployment-branches-and-tags) is the authoritative branch boundary. The workflow's tokenless `main` guard is an additional repository control.
-
-### 4. Generate, create and attach a fresh four-hour temporary policy
-
-Check that the local clock is accurate. Generate this document only when the root session, reviewed Terraform plan workflow and operator are ready to proceed:
+Render the two reviewed templates to new private files. The renderer refuses
+overwrites and symlink destinations.
 
 ```bash
-[[ ! -e "${private_dir}/temporary-bootstrap-policy.json" && \
-  ! -L "${private_dir}/temporary-bootstrap-policy.json" ]]
-"${module_dir}/scripts/generate-temporary-policy.sh"
-jq --color-output . \
-  "${private_dir}/temporary-bootstrap-policy.json" | less -R
+"${module_dir}/scripts/generate-permissions-boundaries.sh" \
+  "${aws_account_id}" \
+  "${state_bucket_name}" \
+  "${private_dir}/terraform-admin-boundary.json" \
+  "${private_dir}/github-actions-boundary.json"
+
+jq . "${private_dir}/terraform-admin-boundary.json"
+jq . "${private_dir}/github-actions-boundary.json"
 ```
 
-The generator embeds one absolute UTC expiry exactly four hours after generation. Review the resolved document locally without copying its account-specific contents elsewhere. In the root console, create the customer-managed policy `opensearch-lab-temporary-bootstrap` from that file and attach it only to `opensearch-lab-bootstrap`. Then sign out of root.
+Review both resolved policies locally against their tracked templates. Do not
+paste the output into an issue, workflow log or commit.
 
-This policy is only for the initial bootstrap or an explicitly reviewed break-glass recovery. It is never used for routine Terraform. Every use requires a newly generated document because the absolute expiry is embedded in every allow statement. Never edit the expiry, extend an old policy, create a new version to refresh it or regenerate while an earlier policy is attached. If an attempt expires or fails, stop and assess any partial state. Remove the old attachment and policy before generating and creating a fresh one for an approved recovery.
+In the AWS console, using the root MFA session:
 
-The temporary policy and the later Terraform administration policy allow `billing:GetBillingViewData` only for the account's primary billing view, `arn:aws:billing::<ACCOUNT_ID>:billingview/primary`. They do not grant access to custom billing views or other accounts' views. AWS defines the [billing-view ARN format](https://docs.aws.amazon.com/service-authorization/latest/reference/list_billing.html) and gives every account one [primary billing view](https://docs.aws.amazon.com/aws-cost-management/latest/APIReference/API_billing_ListBillingViews.html).
+1. Confirm that the exact intended user, roles, OIDC provider, budget, state
+   bucket and customer-managed policies do not already exist. An access-denied
+   response is not proof of absence.
+2. Create the IAM user `opensearch-lab-bootstrap` at path `/` with console
+   sign-in and MFA.
+3. Attach only the AWS-managed `SignInLocalDevelopmentAccess` policy. Do not
+   add access keys, groups, inline policies or a permissions boundary.
+4. Create `opensearch-lab-terraform-admin-boundary` from the reviewed Terraform
+   administration boundary.
+5. Create `opensearch-lab-github-actions-boundary` from the reviewed GitHub
+   Actions boundary.
 
-The pinned AWS provider 6.61.0 calls `HeadBucket` while managing the state bucket. AWS authorises `HeadBucket` through [`s3:ListBucket`](https://docs.aws.amazon.com/AmazonS3/latest/userguide/security_iam_service-with-iam.html), so the temporary and Terraform administration policies include an unprefixed allowance on this dedicated bucket. This permits those identities to enumerate every object name in the bucket. The unprefixed listing does not grant object-content access. The policies grant object actions only on `bootstrap/terraform.tfstate`, which can be read and written, and `bootstrap/terraform.tfstate.tflock`, which can be read, written and deleted. The GitHub Actions role retains its separate `s3:prefix` condition, which restricts its listing to those two exact keys.
+These allow-only boundaries are durable root-created controls. Do not attach
+them to the bootstrap user. Terraform references them but cannot change their
+contents or default versions.
 
-The state bucket must remain dedicated to this bootstrap stack. Do not store other data in it or share it with unrelated Terraform stacks, because temporary and human administration can enumerate all names in the bucket.
+In GitHub, create `<github-environment>` outside Terraform. Restrict deployment
+to the protected `main` branch and exclude tags and untrusted pull-request
+contexts. Record the owner and repository numeric IDs in the private tfvars.
+Repository and Environment settings remain manual controls.
 
-### 5. Authenticate the exact bootstrap user
+## 3. Grant four-hour bootstrap access
 
-The local AWS CLI must support `aws login`; the command first appeared in AWS CLI 2.32.0. These checks produce no account identifiers:
+Generate the temporary policy only when the operator, root session and review
+window are ready. It contains one literal UTC expiry four hours after creation
+and is bound to the exact bootstrap principal and its sign-in session.
 
 ```bash
-aws login help >/dev/null
-aws configure set region eu-west-1 --profile opensearch-lab-terraform
+"${module_dir}/scripts/generate-temporary-policy.sh" \
+  "${aws_account_id}" \
+  "${state_bucket_name}" \
+  "${private_dir}/temporary-bootstrap-policy.json"
+
+jq . "${private_dir}/temporary-bootstrap-policy.json"
+```
+
+Review it locally. In the root console, create the customer-managed policy
+`opensearch-lab-temporary-bootstrap` from that file and attach it only to
+`opensearch-lab-bootstrap`. Sign out of root.
+
+Do not edit the expiry, create a new policy version to extend it or regenerate
+the document while an earlier temporary policy is attached. If the window
+expires, stop and use the recovery guide.
+
+## 4. Authenticate with `aws login`
+
+The profile contains login configuration, not access keys. Complete the browser
+flow as the exact bootstrap user and its MFA-protected sign-in session.
+
+```bash
+aws configure set region "${aws_region}" --profile opensearch-lab-terraform
 aws configure set output json --profile opensearch-lab-terraform
-aws login --profile opensearch-lab-terraform --region eu-west-1 >/dev/null
-[[ -f "${AWS_CONFIG_FILE}" && ! -L "${AWS_CONFIG_FILE}" && \
-  -O "${AWS_CONFIG_FILE}" ]]
-chmod 600 "${AWS_CONFIG_FILE}"
-[[ ! -e "${AWS_SHARED_CREDENTIALS_FILE}" && \
-  ! -L "${AWS_SHARED_CREDENTIALS_FILE}" ]]
+aws login --profile opensearch-lab-terraform --region "${aws_region}"
+```
 
-login_session="$(
-  aws configure get login_session --profile opensearch-lab-terraform
-)"
-[[ "${login_session}" == \
-  "arn:aws:iam::${AWS_ACCOUNT_ID}:user/opensearch-lab-bootstrap" ]]
+Confirm the configured login principal, credential source and caller identity
+without printing the account identity.
 
-credential_resolution="$(
-  aws configure list --profile opensearch-lab-terraform
-)"
-[[ "$(grep -Ec \
+```bash
+test "$(aws configure get login_session \
+  --profile opensearch-lab-terraform)" = \
+  "arn:aws:iam::${aws_account_id}:user/opensearch-lab-bootstrap"
+
+credential_resolution="$(aws configure list \
+  --profile opensearch-lab-terraform)"
+test "$(grep -Ec \
   '^[[:space:]]*(access_key|secret_key).*login' \
-  <<<"${credential_resolution}")" == '2' ]]
+  <<<"${credential_resolution}")" -eq 2
 
-caller_identity="$(
-  aws --profile opensearch-lab-terraform \
-    sts get-caller-identity --output json
-)"
-jq -e --arg account "${AWS_ACCOUNT_ID}" '
-  .Account == $account
-  and .Arn == ("arn:aws:iam::" + $account + ":user/opensearch-lab-bootstrap")
-' >/dev/null <<<"${caller_identity}"
-
-unset login_session credential_resolution caller_identity AWS_ACCOUNT_ID
-```
-
-In the browser flow, select the exact `opensearch-lab-bootstrap` user and complete its MFA challenge. Stop if the selected account or identity differs, the credential source is not `login`, or `.aws/credentials` is created.
-
-### 6. Apply Terraform through the local backend
-
-The initial plan must run as the login user, with the administration-role variable still null. Save the plan only in the private directory and review it locally.
-
-```bash
-unset TF_VAR_terraform_admin_role_arn
-if grep -Eq '^[[:space:]]*terraform_admin_role_arn[[:space:]]*=' \
-  "${private_dir}/terraform.tfvars"; then
-  echo 'The administration-role ARN must be absent from the initial variables.' >&2
-  exit 1
-fi
-
-AWS_PROFILE=opensearch-lab-terraform \
-  terraform -chdir="${module_dir}" init -reconfigure -input=false
-AWS_PROFILE=opensearch-lab-terraform \
-  terraform -chdir="${module_dir}" plan \
-  -input=false \
-  -var-file="${private_dir}/terraform.tfvars" \
-  -out="${private_dir}/initial-bootstrap.tfplan" \
-  >/dev/null
-chmod 600 "${private_dir}/initial-bootstrap.tfplan"
-
-terraform -chdir="${module_dir}" show -json \
-  "${private_dir}/initial-bootstrap.tfplan" |
-  jq -e '
-    [
-      "aws_budgets_budget.account_cost",
-      "aws_iam_openid_connect_provider.github",
-      "aws_iam_role.github_actions",
-      "aws_iam_role.terraform_admin",
-      "aws_iam_role_policy.github_actions_state",
-      "aws_iam_role_policy.terraform_admin",
-      "aws_s3_bucket.state",
-      "aws_s3_bucket_lifecycle_configuration.state",
-      "aws_s3_bucket_ownership_controls.state",
-      "aws_s3_bucket_policy.state",
-      "aws_s3_bucket_public_access_block.state",
-      "aws_s3_bucket_server_side_encryption_configuration.state",
-      "aws_s3_bucket_versioning.state"
-    ] as $expected
-    | [.resource_changes[] | select(.mode == "managed")] as $managed
-    | ($managed | length) == 13
-      and all($managed[]; .change.actions == ["create"])
-      and ([$managed[].address] | sort) == ($expected | sort)
+aws --profile opensearch-lab-terraform sts get-caller-identity \
+  --output json |
+  jq -e --arg account "${aws_account_id}" '
+    .Account == $account and
+    .Arn == ("arn:aws:iam::" + $account +
+      ":user/opensearch-lab-bootstrap")
   ' >/dev/null
-
-terraform -chdir="${module_dir}" show -no-color \
-  "${private_dir}/initial-bootstrap.tfplan" | less
-
-AWS_PROFILE=opensearch-lab-terraform \
-  terraform -chdir="${module_dir}" apply -input=false \
-  "${private_dir}/initial-bootstrap.tfplan" \
-  >/dev/null
-
-test -s "${private_dir}/terraform.tfstate"
-"${module_dir}/scripts/check-backend-contract.sh" \
-  local "${module_dir}/backend.tf" >/dev/null
-rm -f "${private_dir}/initial-bootstrap.tfplan"
+unset credential_resolution
 ```
 
-The reviewed plan must contain exactly those 13 creates and no update, delete or replacement. Do not use `-auto-approve`, `-target` or a live apply without the saved plan. If planning or applying fails, preserve the local state and plan, do not rerun blindly and do not proceed to migration.
+Stop if the identity differs or the credential source is not `login`. Do not
+fall back to access keys or an ambient default profile.
 
-### 7. Configure the administration role profile
+## 5. Initialise temporary local state
 
-Capture the sensitive Terraform output without displaying it, then create the role profile in the ignored repository-local AWS configuration:
+The ignored local backend writes state only below the private directory. Stop
+if `backend.tf` or `.terraform` already exists. Existing backend metadata may
+identify the live S3 installation. Do not delete it to make the fresh-install
+path proceed. Use the routine S3 path instead.
 
 ```bash
-terraform_admin_role_arn="$(
+test ! -e "${module_dir}/backend.tf" && \
+  test ! -L "${module_dir}/backend.tf" && \
+  test ! -e "${module_dir}/.terraform" && \
+  test ! -L "${module_dir}/.terraform" && \
+  cp "${module_dir}/backend.local.tf.example" \
+    "${module_dir}/backend.tf" && \
+  chmod 600 "${module_dir}/backend.tf" && \
   AWS_PROFILE=opensearch-lab-terraform \
-    terraform -chdir="${module_dir}" output -raw terraform_admin_role_arn
-)"
-[[ "${terraform_admin_role_arn}" =~ \
-  ^arn:aws:iam::[0-9]{12}:role/opensearch-lab-terraform-admin$ ]]
-
-aws configure set role_arn "${terraform_admin_role_arn}" \
-  --profile opensearch-lab-admin
-aws configure set source_profile opensearch-lab-terraform \
-  --profile opensearch-lab-admin
-aws configure set role_session_name terraform-bootstrap-management \
-  --profile opensearch-lab-admin
-aws configure set region eu-west-1 --profile opensearch-lab-admin
-aws configure set output json --profile opensearch-lab-admin
-
-[[ "$(aws configure get source_profile --profile opensearch-lab-admin)" == \
-  'opensearch-lab-terraform' ]]
-[[ "$(aws configure get role_arn --profile opensearch-lab-admin)" == \
-  "${terraform_admin_role_arn}" ]]
-
-admin_identity="$(
-  aws --profile opensearch-lab-admin sts get-caller-identity --output json
-)"
-jq -e '
-  .Arn | test("^arn:aws:sts::[0-9]{12}:assumed-role/opensearch-lab-terraform-admin/[^/]+$")
-' >/dev/null <<<"${admin_identity}"
-unset admin_identity terraform_admin_role_arn
+    aws sts get-caller-identity --output json |
+  jq -e --arg account "${aws_account_id}" '
+    .Account == $account and
+    .Arn == ("arn:aws:iam::" + $account +
+      ":user/opensearch-lab-bootstrap")
+  ' >/dev/null && \
+  AWS_PROFILE=opensearch-lab-terraform \
+    terraform -chdir="${module_dir}" init
+fresh_init_exit=$?
+printf 'Guarded fresh initialisation result: %s\n' "${fresh_init_exit}"
+test "${fresh_init_exit}" -eq 0
 ```
 
-The admin profile contains no credentials. The CLI obtains its source credentials from the `opensearch-lab-terraform` login session and assumes only `opensearch-lab-terraform-admin`.
+Do not use this local backend on the existing installation or on any stack that
+already has remote state.
 
-### 8. Migrate state
+## 6. Review and apply the exact saved plan
 
-Do not run `render-s3-backend.sh` during this migration flow and do not run `terraform init -migrate-state` manually. The migration script reads the state bucket and administration-role ARN from Terraform output, writes the exact S3 migration backend, proves the remote state and lock keys are empty, migrates and compares state, then injects `TF_VAR_terraform_admin_role_arn` into its own post-migration plan.
+Create one plan inside the ignored private directory. Terraform verifies the
+configured account through `allowed_account_ids` before planning resources.
+That provider setting prevents a cross-account mistake. It does not prove that
+the caller is the intended same-account user or role, so require the exact
+bootstrap IAM user immediately before the fresh plan.
 
 ```bash
-"${module_dir}/scripts/migrate-state.sh" --approved
+test "${fresh_init_exit:-125}" -eq 0 && \
+  test ! -e "${plan_file}" && \
+  test ! -L "${plan_file}" && \
+  AWS_PROFILE=opensearch-lab-terraform \
+    aws sts get-caller-identity --output json |
+  jq -e --arg account "${aws_account_id}" '
+    .Account == $account and
+    .Arn == ("arn:aws:iam::" + $account +
+      ":user/opensearch-lab-bootstrap")
+  ' >/dev/null && \
+  AWS_PROFILE=opensearch-lab-terraform \
+    terraform -chdir="${module_dir}" plan \
+    -var-file="../../${tfvars_file}" \
+    -out="../../${plan_file}" && \
+  chmod 600 "${plan_file}" && \
+  terraform -chdir="${module_dir}" show \
+    -no-color "../../${plan_file}"
+fresh_plan_exit=$?
+test "${fresh_plan_exit}" -ne 0 || fresh_init_exit=125
+printf 'Guarded fresh-plan result: %s\n' "${fresh_plan_exit}"
+test "${fresh_plan_exit}" -eq 0
 ```
 
-Stop on any error and follow the script's phase-specific diagnostic. If it reports a partial or indeterminate migration, do not restore local state, delete remote objects, force-unlock, replace `backend.tf` or retry. If it reports a committed migration, S3 is authoritative: follow the recovery procedure below and never rerun `migrate-state.sh --approved` or `terraform init -migrate-state`. On success, S3 is authoritative and the private pre-migration recovery copy remains for controlled recovery.
+Review every create, resolved identity, trust condition, permissions boundary,
+budget notification and state-bucket control. Stop on any unexpected existing
+resource, update, replacement or deletion. A saved plan can contain private
+values even when variables are marked sensitive, so keep the review local.
 
-The migration keeps its mode-600 recovery and verification files under `.private/terraform-bootstrap/`: `pre-migration-*.tfstate`, `post-migration-*.tfstate`, `pre-migration-backend-*.tf`, an optional `pre-migration-backend-cache-*.tfstate` and `post-migration-lock-check.tfplan`. Never stage, paste or publish these files, the resolved policies, `terraform.tfvars`, `terraform.tfstate`, `infra/bootstrap/backend.tf`, the repository-local `.aws/` directory or the AWS CLI role cache at `~/.aws/cli/cache`.
-
-#### Manual recovery after a committed migration
-
-If the S3 write committed but post-migration verification failed, stop and treat S3 as authoritative. Retain the backend configuration, cached backend metadata and all recovery evidence unchanged. The recovery must be designed and reviewed for the specific failure before any state or backend operation is run.
-
-Never rerun `migrate-state.sh --approved` or `terraform init -migrate-state` after the S3 write commits. Do not reactivate local state, push state, delete remote objects, force-unlock or replace `backend.tf` as an attempted recovery. Continue with step 9 only after the reviewed recovery has established that the committed remote state is sound and post-migration verification has completed successfully.
-
-### 9. Verify before removing temporary access
-
-The verifier requires the exact S3 migration backend, so it must run after migration, never immediately after the initial apply.
+Apply that exact file. Do not run an unsaved apply, use `-target` or substitute a
+new plan after review.
 
 ```bash
-export BUDGET_NOTIFICATION_EMAIL
-AWS_PROFILE=opensearch-lab-admin \
-  "${module_dir}/scripts/verify-bootstrap-access.sh" --before-removal
+test "${fresh_plan_exit:-125}" -eq 0 && \
+  fresh_plan_exit=125 && \
+  AWS_PROFILE=opensearch-lab-terraform \
+  aws sts get-caller-identity --output json |
+  jq -e --arg account "${aws_account_id}" '
+    .Account == $account and
+    .Arn == ("arn:aws:iam::" + $account +
+      ":user/opensearch-lab-bootstrap")
+  ' >/dev/null && \
+  AWS_PROFILE=opensearch-lab-terraform \
+    terraform -chdir="${module_dir}" apply \
+    "../../${plan_file}"
+fresh_apply_exit=$?
+printf 'Guarded fresh-apply result: %s\n' "${fresh_apply_exit}"
+test "${fresh_apply_exit}" -eq 0
 ```
 
-The email must still be the exact private value written to the initial tfvars. Do not pipe, suppress or ignore the verifier status. If it fails, stop without detaching, deleting, extending or regenerating the temporary policy.
+If apply fails, preserve the plan, local state, backend declaration and backend
+metadata. Do not migrate or retry blindly.
 
-### 10. Detach and delete the temporary policy
+## 7. Configure the administration-role profile
 
-Use the verified admin profile and exact names only:
+Capture the role output without displaying it. Configure an ordinary AWS CLI
+role profile whose source is the `aws login` profile.
 
 ```bash
-admin_identity="$(
-  aws --profile opensearch-lab-admin sts get-caller-identity --output json
-)"
-account_id="$(jq -er '.Account | select(test("^[0-9]{12}$"))' \
-  <<<"${admin_identity}")"
-temporary_policy_arn="arn:aws:iam::${account_id}:policy/opensearch-lab-temporary-bootstrap"
+test "${fresh_apply_exit:-125}" -eq 0 && \
+  admin_role_arn="$(
+  AWS_PROFILE=opensearch-lab-terraform \
+    terraform -chdir="${module_dir}" output \
+    -raw terraform_admin_role_arn
+)" && \
+  aws configure set role_arn "${admin_role_arn}" \
+    --profile opensearch-lab-admin && \
+  aws configure set source_profile opensearch-lab-terraform \
+    --profile opensearch-lab-admin && \
+  aws configure set role_session_name terraform-foundation-management \
+    --profile opensearch-lab-admin && \
+  aws configure set region "${aws_region}" \
+    --profile opensearch-lab-admin && \
+  aws configure set output json --profile opensearch-lab-admin && \
+  aws --profile opensearch-lab-admin sts get-caller-identity \
+    --output json |
+  jq -e --arg account "${aws_account_id}" '
+    .Account == $account and
+    (.Arn | test("^arn:aws:sts::" + $account +
+      ":assumed-role/opensearch-lab-terraform-admin/[^/]+$"))
+  ' >/dev/null
+admin_profile_exit=$?
+printf 'Administration-profile result: %s\n' "${admin_profile_exit}"
+test "${admin_profile_exit}" -eq 0
+```
 
-aws --profile opensearch-lab-admin iam detach-user-policy \
+The backend and provider will now use the same normal AWS SDK credential chain
+through `AWS_PROFILE=opensearch-lab-admin`. The role ARN is not a Terraform
+variable. The identity check fixes the account and role name while accepting
+the profile's non-empty STS session suffix. An existing installation may retain
+its already reviewed role session name without changing the selected role.
+
+## 8. Preserve migration recovery material
+
+Read the created bucket name from Terraform without displaying it, require it
+to match the reviewed renderer input, and preserve private copies of the local
+state, backend declaration and backend metadata. The destination must be new.
+
+```bash
+recovery_dir="${private_dir}/pre-migration-recovery"
+test "${fresh_apply_exit:-125}" -eq 0 && \
+  test "${admin_profile_exit:-125}" -eq 0 && \
+  created_state_bucket="$(
+  AWS_PROFILE=opensearch-lab-terraform \
+    terraform -chdir="${module_dir}" output -raw state_bucket_name
+)" && \
+  test "${created_state_bucket}" = "${state_bucket_name}" && \
+  test ! -e "${recovery_dir}" && \
+  test ! -L "${recovery_dir}" && \
+  mkdir "${recovery_dir}" && \
+  chmod 700 "${recovery_dir}" && \
+  install -m 600 "${private_dir}/terraform.tfstate" \
+    "${recovery_dir}/local.tfstate" && \
+  install -m 600 "${module_dir}/backend.tf" \
+    "${recovery_dir}/backend.tf" && \
+  install -m 600 "${module_dir}/.terraform/terraform.tfstate" \
+    "${recovery_dir}/backend-metadata.tfstate"
+recovery_copy_exit=$?
+printf 'Recovery copy result: %s\n' "${recovery_copy_exit}"
+test "${recovery_copy_exit}" -eq 0
+```
+
+Keep these files unchanged until the refreshed remote plan in the next section
+returns exit code `0`.
+
+## 9. Migrate natively to S3
+
+Replace the ignored local declaration with the tracked partial S3 backend. The
+tracked file deliberately contains no bucket, Region, profile or credentials.
+
+Use Terraform's native migration with every backend setting explicit. Read the
+prompt, confirm that it describes copying the existing local state to S3, then
+accept it.
+
+```bash
+test "${recovery_copy_exit:-125}" -eq 0 && \
+  recovery_copy_exit=125 && \
+  cp "${module_dir}/backend.s3.tf.example" \
+    "${module_dir}/backend.tf" && \
+  chmod 600 "${module_dir}/backend.tf" && \
+  AWS_PROFILE=opensearch-lab-admin \
+    aws sts get-caller-identity --output json |
+  jq -e --arg account "${aws_account_id}" '
+    .Account == $account and
+    (.Arn | test("^arn:aws:sts::" + $account +
+      ":assumed-role/opensearch-lab-terraform-admin/[^/]+$"))
+  ' >/dev/null && \
+  AWS_PROFILE=opensearch-lab-admin \
+    terraform -chdir="${module_dir}" init -migrate-state \
+    -backend-config="bucket=${created_state_bucket}" \
+    -backend-config="key=bootstrap/terraform.tfstate" \
+    -backend-config="region=${aws_region}" \
+    -backend-config="encrypt=true" \
+    -backend-config="use_lockfile=true"
+migration_exit=$?
+printf 'Guarded migration result: %s\n' "${migration_exit}"
+test "${migration_exit}" -eq 0
+```
+
+Do not add migration flags or bypass Terraform's native process. If the result
+is unclear, preserve all files and follow the recovery guide.
+
+Run a normal refresh-enabled plan through the administration role. Exit code
+`0` is required. Exit code `2` means drift or configuration change, and exit
+code `1` means an error. Neither is success.
+
+```bash
+test "${migration_exit:-125}" -eq 0 && \
+  AWS_PROFILE=opensearch-lab-admin \
+  aws sts get-caller-identity --output json |
+  jq -e --arg account "${aws_account_id}" '
+    .Account == $account and
+    (.Arn | test("^arn:aws:sts::" + $account +
+      ":assumed-role/opensearch-lab-terraform-admin/[^/]+$"))
+  ' >/dev/null && \
+  AWS_PROFILE=opensearch-lab-admin \
+    terraform -chdir="${module_dir}" plan \
+    -var-file="../../${tfvars_file}" \
+    -detailed-exitcode
+post_migration_exit=$?
+printf 'Guarded post-migration check result: %s\n' \
+  "${post_migration_exit}"
+test "${post_migration_exit}" -eq 0 && rm -- "${plan_file}"
+```
+
+Result `0` means that the prerequisite, exact-role check and zero-change plan
+all passed. Result `2` means the plan found drift or configuration change.
+Result `1` can mean a failed prerequisite, identity mismatch or Terraform
+error. Do not remove temporary access or recovery material unless the result is
+`0`. After it passes, the saved account-foundation plan is removed. Never
+upload a saved plan to GitHub.
+
+The S3 backend is now authoritative. Terraform continues to manage its own
+bucket. Versioning, SSE-S3, public-access blocking, `BucketOwnerEnforced`, the
+HTTPS-only bucket policy, non-current-version retention, `force_destroy = false`
+and `prevent_destroy` remain part of the reviewed configuration.
+
+## 10. Read back the durable boundaries
+
+Use the administration role to retrieve each live default policy version into
+the private directory and compare its JSON structure with the reviewed local
+document.
+
+```bash
+admin_boundary_arn="arn:aws:iam::${aws_account_id}:policy/opensearch-lab-terraform-admin-boundary"
+admin_boundary_version="$(aws --profile opensearch-lab-admin \
+  iam get-policy --policy-arn "${admin_boundary_arn}" \
+  --query 'Policy.DefaultVersionId' --output text)" && \
+  aws --profile opensearch-lab-admin iam get-policy-version \
+  --policy-arn "${admin_boundary_arn}" \
+  --version-id "${admin_boundary_version}" \
+  --query 'PolicyVersion.Document' --output json \
+  >"${private_dir}/terraform-admin-boundary.live.json" && \
+  chmod 600 "${private_dir}/terraform-admin-boundary.live.json" && \
+  jq -e --slurpfile live \
+  "${private_dir}/terraform-admin-boundary.live.json" \
+  '. == $live[0]' \
+  "${private_dir}/terraform-admin-boundary.json" >/dev/null
+admin_boundary_review_exit=$?
+printf 'Administration-boundary review result: %s\n' \
+  "${admin_boundary_review_exit}"
+test "${admin_boundary_review_exit}" -eq 0
+```
+
+```bash
+github_boundary_arn="arn:aws:iam::${aws_account_id}:policy/opensearch-lab-github-actions-boundary"
+test "${admin_boundary_review_exit:-125}" -eq 0 && \
+  github_boundary_version="$(aws --profile opensearch-lab-admin \
+  iam get-policy --policy-arn "${github_boundary_arn}" \
+  --query 'Policy.DefaultVersionId' --output text)" && \
+  aws --profile opensearch-lab-admin iam get-policy-version \
+  --policy-arn "${github_boundary_arn}" \
+  --version-id "${github_boundary_version}" \
+  --query 'PolicyVersion.Document' --output json \
+  >"${private_dir}/github-actions-boundary.live.json" && \
+  chmod 600 "${private_dir}/github-actions-boundary.live.json" && \
+  jq -e --slurpfile live \
+  "${private_dir}/github-actions-boundary.live.json" \
+  '. == $live[0]' \
+  "${private_dir}/github-actions-boundary.json" >/dev/null
+github_boundary_review_exit=$?
+printf 'GitHub-boundary review result: %s\n' \
+  "${github_boundary_review_exit}"
+test "${github_boundary_review_exit}" -eq 0
+```
+
+Confirm that both Terraform-created roles use the exact durable boundary ARNs.
+
+```bash
+test "${github_boundary_review_exit:-125}" -eq 0 && \
+  aws --profile opensearch-lab-admin iam get-role \
+  --role-name opensearch-lab-terraform-admin |
+  jq -e --arg boundary "${admin_boundary_arn}" '
+    .Role.PermissionsBoundary.PermissionsBoundaryArn == $boundary
+  ' >/dev/null && \
+  aws --profile opensearch-lab-admin iam get-role \
+  --role-name opensearch-lab-github-actions |
+  jq -e --arg boundary "${github_boundary_arn}" '
+    .Role.PermissionsBoundary.PermissionsBoundaryArn == $boundary
+  ' >/dev/null
+role_boundary_review_exit=$?
+printf 'Role-boundary review result: %s\n' \
+  "${role_boundary_review_exit}"
+test "${role_boundary_review_exit}" -eq 0
+```
+
+Stop on any mismatch. Do not update either boundary as part of this runbook.
+
+## 11. Check bootstrap-user hygiene
+
+Run each explicit check through the administration role. Before temporary
+policy removal, the bootstrap user must have no long-lived credential or
+inherited permission, and exactly the sign-in and temporary policies attached.
+
+```bash
+test "${role_boundary_review_exit:-125}" -eq 0 && \
+  aws --profile opensearch-lab-admin iam get-user \
+  --user-name opensearch-lab-bootstrap |
+  jq -e '
+    .User.UserName == "opensearch-lab-bootstrap" and
+    .User.Path == "/" and
+    (.User | has("PermissionsBoundary") | not)
+  ' >/dev/null && \
+  aws --profile opensearch-lab-admin iam list-access-keys \
+  --user-name opensearch-lab-bootstrap |
+  jq -e '.AccessKeyMetadata | length == 0' >/dev/null && \
+  aws --profile opensearch-lab-admin iam list-groups-for-user \
+  --user-name opensearch-lab-bootstrap |
+  jq -e '.Groups | length == 0' >/dev/null && \
+  aws --profile opensearch-lab-admin iam list-user-policies \
+  --user-name opensearch-lab-bootstrap |
+  jq -e '.PolicyNames | length == 0' >/dev/null && \
+  aws --profile opensearch-lab-admin iam list-mfa-devices \
+  --user-name opensearch-lab-bootstrap |
+  jq -e '.MFADevices | length >= 1' >/dev/null
+bootstrap_hygiene_exit=$?
+printf 'Bootstrap-user hygiene result: %s\n' "${bootstrap_hygiene_exit}"
+test "${bootstrap_hygiene_exit}" -eq 0
+```
+
+```bash
+test "${bootstrap_hygiene_exit:-125}" -eq 0 && \
+  aws --profile opensearch-lab-admin iam list-attached-user-policies \
+  --user-name opensearch-lab-bootstrap |
+  jq -e '
+    [.AttachedPolicies[].PolicyName] | sort == [
+      "SignInLocalDevelopmentAccess",
+      "opensearch-lab-temporary-bootstrap"
+    ]
+  ' >/dev/null
+temporary_attachment_review_exit=$?
+printf 'Temporary-policy attachment review result: %s\n' \
+  "${temporary_attachment_review_exit}"
+test "${temporary_attachment_review_exit}" -eq 0
+```
+
+## 12. Remove temporary access
+
+Require the temporary policy to be attached only to the exact bootstrap user,
+then detach and delete it through the administration role.
+
+```bash
+temporary_policy_arn="arn:aws:iam::${aws_account_id}:policy/opensearch-lab-temporary-bootstrap"
+test "${post_migration_exit:-125}" -eq 0 && \
+  test "${temporary_attachment_review_exit:-125}" -eq 0 && \
+  post_migration_exit=125 && \
+  temporary_attachment_review_exit=125 && \
+  AWS_PROFILE=opensearch-lab-admin \
+  aws sts get-caller-identity --output json |
+  jq -e --arg account "${aws_account_id}" '
+    .Account == $account and
+    (.Arn | test("^arn:aws:sts::" + $account +
+      ":assumed-role/opensearch-lab-terraform-admin/[^/]+$"))
+  ' >/dev/null && \
+  aws --profile opensearch-lab-admin iam list-entities-for-policy \
+  --policy-arn "${temporary_policy_arn}" |
+  jq -e '
+    [.PolicyUsers[].UserName] == ["opensearch-lab-bootstrap"] and
+    (.PolicyGroups | length == 0) and
+    (.PolicyRoles | length == 0)
+  ' >/dev/null && \
+  aws --profile opensearch-lab-admin iam detach-user-policy \
   --user-name opensearch-lab-bootstrap \
+  --policy-arn "${temporary_policy_arn}" && \
+  aws --profile opensearch-lab-admin iam delete-policy \
   --policy-arn "${temporary_policy_arn}"
-aws --profile opensearch-lab-admin iam delete-policy \
-  --policy-arn "${temporary_policy_arn}"
-
-unset admin_identity account_id temporary_policy_arn
+temporary_access_removal_exit=$?
+printf 'Temporary-access removal result: %s\n' \
+  "${temporary_access_removal_exit}"
+test "${temporary_access_removal_exit}" -eq 0
 ```
 
-Stop if either command fails. Do not remove the login policy, bootstrap user or either durable permissions boundary.
-
-### 11. Verify after removing temporary access
+Repeat the attached-policy and access-key checks. Only the sign-in policy may
+remain.
 
 ```bash
-AWS_PROFILE=opensearch-lab-admin \
-  "${module_dir}/scripts/verify-bootstrap-access.sh" --after-removal
-rm -f "${private_dir}/temporary-bootstrap-policy.json"
-unset BUDGET_NOTIFICATION_EMAIL
+test "${temporary_access_removal_exit:-125}" -eq 0 && \
+  aws --profile opensearch-lab-admin iam list-attached-user-policies \
+  --user-name opensearch-lab-bootstrap |
+  jq -e '
+    [.AttachedPolicies[].PolicyName] == [
+      "SignInLocalDevelopmentAccess"
+    ]
+  ' >/dev/null && \
+  aws --profile opensearch-lab-admin iam list-access-keys \
+  --user-name opensearch-lab-bootstrap |
+  jq -e '.AccessKeyMetadata | length == 0' >/dev/null && \
+  rm -- "${private_dir}/temporary-bootstrap-policy.json"
 ```
 
-This phase proves that the temporary managed policy is absent and that the bootstrap user's only attached policy is `SignInLocalDevelopmentAccess`. A failure means cleanup is incomplete. The local resolved temporary document is removed only after that pass so it cannot be reused.
+Do not remove either durable boundary, the bootstrap user or its login policy.
+The user remains the MFA-backed source principal for assuming the Terraform
+administration role.
 
-### 12. Configure and dispatch GitHub OIDC verification
+## 13. Verify GitHub OIDC
 
-First confirm that the reviewed `.github/workflows/verify-aws-oidc.yml` is present on `main` and that the `aws-bootstrap` Environment still admits only `main`. Capture the role ARN without printing it and store it only as the Environment secret `AWS_OIDC_ROLE_ARN`, never as a repository secret:
+In `<github-environment>`, set the non-sensitive Environment variable
+`TF_VAR_aws_region` to `<aws-region>`. Capture the role ARN without printing it
+and store it as the Environment secret `AWS_OIDC_ROLE_ARN`. It is installation
+configuration, not an AWS credential.
 
 ```bash
-gh workflow view verify-aws-oidc.yml \
-  --ref main \
-  --repo github.com/ocdaithi/opensearch-operator-reliability-lab \
-  --yaml >/dev/null
-
-github_actions_role_arn="$(
-  AWS_PROFILE=opensearch-lab-terraform \
-    terraform -chdir="${module_dir}" output -raw github_actions_role_arn
-)"
-[[ "${github_actions_role_arn}" =~ \
-  ^arn:aws:iam::[0-9]{12}:role/opensearch-lab-github-actions$ ]]
-printf '%s' "${github_actions_role_arn}" |
+gh variable set TF_VAR_aws_region \
+  --env "<github-environment>" \
+  --repo "<github-owner>/<github-repository>" \
+  --body "<aws-region>" && \
+  github_actions_role_arn="$(
+  AWS_PROFILE=opensearch-lab-admin \
+    terraform -chdir="${module_dir}" output \
+    -raw github_actions_role_arn
+)" && \
+  printf '%s' "${github_actions_role_arn}" |
   gh secret set AWS_OIDC_ROLE_ARN \
-    --env aws-bootstrap \
-    --repo github.com/ocdaithi/opensearch-operator-reliability-lab
+  --env "<github-environment>" \
+  --repo "<github-owner>/<github-repository>"
+oidc_configuration_exit=$?
 unset github_actions_role_arn
-
-dispatch_response="$(
-  gh api --method POST \
-    --hostname github.com \
-    -H 'Accept: application/vnd.github+json' \
-    -H 'X-GitHub-Api-Version: 2026-03-10' \
-    /repos/ocdaithi/opensearch-operator-reliability-lab/actions/workflows/verify-aws-oidc.yml/dispatches \
-    -f ref=main \
-    -F return_run_details=true
-)"
-oidc_run_id="$(jq -er '
-  .workflow_run_id | select(type == "number" and . > 0) | floor
-' <<<"${dispatch_response}")"
-jq -e --arg run_id "${oidc_run_id}" '
-  .html_url == (
-    "https://github.com/ocdaithi/opensearch-operator-reliability-lab/actions/runs/"
-    + $run_id
-  )
-' >/dev/null <<<"${dispatch_response}"
-
-gh run watch "${oidc_run_id}" \
-  --exit-status \
-  --repo github.com/ocdaithi/opensearch-operator-reliability-lab
-oidc_run_json="$(
-  gh run view "${oidc_run_id}" \
-    --repo github.com/ocdaithi/opensearch-operator-reliability-lab \
-    --json headBranch,event,status,conclusion,jobs
-)"
-jq -e '
-  .headBranch == "main"
-  and .event == "workflow_dispatch"
-  and .status == "completed"
-  and .conclusion == "success"
-  and ([.jobs[] | {name, conclusion}] | sort_by(.name)) == ([
-    {name: "Require the reviewed branch", conclusion: "success"},
-    {name: "Verify role assumption", conclusion: "success"}
-  ] | sort_by(.name))
-' >/dev/null <<<"${oidc_run_json}"
-unset dispatch_response oidc_run_id oidc_run_json
+printf 'GitHub OIDC configuration result: %s\n' \
+  "${oidc_configuration_exit}"
+test "${oidc_configuration_exit}" -eq 0
 ```
 
-The versioned [workflow-dispatch endpoint](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event) returns the exact run ID used by the watch and job checks. If the dispatch result is indeterminate, inspect Actions before retrying so a second run is not created blindly. Stop unless both `Require the reviewed branch` and `Verify role assumption` pass; do not recreate or reattach temporary bootstrap access to fix OIDC verification.
-
-### Routine Terraform
-
-For every post-bootstrap Terraform plan or apply, restore the three repository-local AWS path variables, authenticate `opensearch-lab-terraform` with `aws login` if its session has expired, and set the exact administration-role ARN. Use the login profile as the provider source. Using the admin profile while also setting the role variable would attempt to assume the administration role from itself.
-
-One option is a shell variable captured without display:
+Confirm in GitHub that the Environment still permits only protected `main`, and
+that `.github/workflows/verify-aws-oidc.yml` on `main` matches the reviewed
+workflow. Dispatch it with the exact Environment input.
 
 ```bash
-repository_root="$(git rev-parse --show-toplevel)"
-[[ "${PWD}" == "${repository_root}" ]]
-private_dir="${repository_root}/.private/terraform-bootstrap"
-module_dir="${repository_root}/infra/bootstrap"
-aws_dir="${repository_root}/.aws"
-export AWS_CONFIG_FILE="${aws_dir}/config"
-export AWS_SHARED_CREDENTIALS_FILE="${aws_dir}/credentials"
-export AWS_LOGIN_CACHE_DIRECTORY="${aws_dir}/login/cache"
-unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
-unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_ROLE_ARN AWS_ROLE_SESSION_NAME
-unset AWS_WEB_IDENTITY_TOKEN_FILE
-unset AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
-unset AWS_CONTAINER_AUTHORIZATION_TOKEN AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE
-unset AWS_ENDPOINT_URL AWS_ENDPOINT_URL_STS AWS_ENDPOINT_URL_IAM
-unset AWS_ENDPOINT_URL_S3 AWS_ENDPOINT_URL_BUDGETS
-unset AWS_REGION AWS_DEFAULT_REGION
-export AWS_EC2_METADATA_DISABLED=true
-unset TF_VAR_terraform_admin_role_arn
-unset TF_CLI_ARGS TF_CLI_ARGS_plan TF_CLI_ARGS_output
-unset TF_WORKSPACE TF_DATA_DIR TF_PLUGIN_CACHE_DIR
-unset TF_LOG TF_LOG_PATH TF_LOG_CORE TF_LOG_PROVIDER TF_LOG_SDK
-unset TF_LOG_SDK_PROTO TF_LOG_SDK_PROTO_DATA_DIR TF_REATTACH_PROVIDERS
-
-terraform_admin_role_arn="$(
-  AWS_PROFILE=opensearch-lab-terraform \
-    terraform -chdir="${module_dir}" output -raw terraform_admin_role_arn
-)"
-[[ "${terraform_admin_role_arn}" =~ \
-  ^arn:aws:iam::[0-9]{12}:role/opensearch-lab-terraform-admin$ ]]
-export TF_VAR_terraform_admin_role_arn="${terraform_admin_role_arn}"
-AWS_PROFILE=opensearch-lab-terraform \
-  terraform -chdir="${module_dir}" plan \
-  -var-file="${private_dir}/terraform.tfvars"
-unset TF_VAR_terraform_admin_role_arn terraform_admin_role_arn
+test "${oidc_configuration_exit:-125}" -eq 0 && \
+  oidc_configuration_exit=125 && \
+  gh workflow run verify-aws-oidc.yml \
+  --ref main \
+  --repo "<github-owner>/<github-repository>" \
+  -f environment="<github-environment>" && \
+  gh run list \
+  --workflow verify-aws-oidc.yml \
+  --branch main \
+  --event workflow_dispatch \
+  --repo "<github-owner>/<github-repository>" \
+  --limit 5
 ```
 
-The alternative is a separate mode-600 private post-bootstrap variable file, such as `.private/terraform-bootstrap/terraform.post-bootstrap.tfvars`, passed after the initial private file. Do not add the role ARN to the initial private tfvars before migration. Routine Terraform never uses `opensearch-lab-temporary-bootstrap`.
+Open the matching run and require both `Require the reviewed branch` and
+`Verify role assumption` to succeed. The workflow receives an OIDC token and
+temporary AWS credentials. It has no stored AWS access key. If dispatch is
+indeterminate, inspect existing runs before trying again. Do not recreate the
+temporary bootstrap policy to diagnose OIDC.
 
-Two bounded first-write risks remain accepted during this initial operation. Temporary `s3:PutBucketPolicy` access to the exact bucket can write its policy before Terraform establishes the reviewed TLS-only policy. Temporary `iam:CreateRole` access to the exact roles accepts each initial trust document before the verifier confirms it. The required permissions boundaries cap what a newly created role can do, but they cannot constrain the initial trust-policy contents. The controls above reduce the exposure window; they do not eliminate either race.
+## Existing S3-backed installation
 
-### Cost and resource lifecycle
+The existing installation must first prove that this branch describes its live
+foundation without changing local backend configuration. Follow
+[the one-off compatibility check](verify-state.md#one-off-compatibility-check-for-the-existing-installation)
+before using the transition below.
 
-The account, Terraform state, diagnostic evidence and ephemeral resources must be reviewed well before the Free Plan ends or its credits are exhausted. This provides time to decide whether to upgrade, retain durable data and remove temporary resources.
+For that first compatibility plan:
 
-Cost visibility and alerts will be configured before EKS or other material billable resources are created. Durable account bootstrap resources will be kept separate from ephemeral reliability-test resources. These controls are planned, not yet implemented.
+- preserve the current ignored `infra/bootstrap/backend.tf` byte for byte;
+- preserve `infra/bootstrap/.terraform` and its cached backend configuration;
+- do not copy either tracked backend example;
+- do not run `terraform init`, `terraform init -reconfigure` or
+  `terraform init -migrate-state`;
+- require the existing remote state to produce a refreshed zero-change plan
+  through the exact administration-role identity.
 
-## Next checkpoint
+The existing installation is already S3-backed. It must never run the fresh
+local-state migration in section 9.
 
-Apply and verify the reviewed bootstrap only after the manual prerequisites above are complete.
+### Optional local backend transition after compatibility
+
+Only after the compatibility plan returns exit code `0` may an operator review
+a separate local transition from the legacy backend role-assumption
+configuration to the partial ambient-credential backend. This transition does
+not change remote state or AWS configuration. Continue in the same zsh session
+used for the compatibility check so its repository-local configuration,
+cleared environment, account ID and Region remain selected.
+
+Preserve the working backend declaration and cached backend metadata first:
+
+```zsh
+umask 077
+module_dir="infra/bootstrap"
+private_dir=".private/terraform-bootstrap"
+transition_dir="${private_dir}/pre-ambient-backend-transition"
+read -rs "state_bucket_name?Exact existing Terraform state bucket name: "
+printf '\n' >&2
+  test "${compatibility_exit:-125}" -eq 0 && \
+  compatibility_exit=125 && \
+  test -f "${module_dir}/backend.tf" && \
+  test ! -L "${module_dir}/backend.tf" && \
+  test -d "${module_dir}/.terraform" && \
+  test ! -L "${module_dir}/.terraform" && \
+  test -f "${module_dir}/.terraform/terraform.tfstate" && \
+  test ! -L "${module_dir}/.terraform/terraform.tfstate" && \
+  test ! -e "${transition_dir}" && \
+  test ! -L "${transition_dir}" && \
+  mkdir "${transition_dir}" && \
+  chmod 700 "${transition_dir}" && \
+  install -m 600 "${module_dir}/backend.tf" \
+    "${transition_dir}/backend.tf" && \
+  install -m 600 "${module_dir}/.terraform/terraform.tfstate" \
+    "${transition_dir}/backend-metadata.tfstate"
+transition_preservation_exit=$?
+printf 'Backend preservation result: %s\n' \
+  "${transition_preservation_exit}"
+test "${transition_preservation_exit}" -eq 0
+```
+
+Replace only the ignored declaration, then reconfigure the local working
+directory against the same S3 object. Do not use migration mode because the
+authoritative state is already in S3.
+
+```zsh
+test "${transition_preservation_exit:-125}" -eq 0 && \
+  cp "${module_dir}/backend.s3.tf.example" \
+    "${module_dir}/backend.tf" && \
+  chmod 600 "${module_dir}/backend.tf" && \
+  AWS_PROFILE=opensearch-lab-admin \
+    aws sts get-caller-identity --output json |
+  jq -e --arg account "${aws_account_id}" '
+    .Account == $account and
+    (.Arn | test("^arn:aws:sts::" + $account +
+      ":assumed-role/opensearch-lab-terraform-admin/[^/]+$"))
+  ' >/dev/null && \
+  AWS_PROFILE=opensearch-lab-admin \
+    terraform -chdir="${module_dir}" init -reconfigure \
+    -backend-config="bucket=${state_bucket_name}" \
+    -backend-config="key=bootstrap/terraform.tfstate" \
+    -backend-config="region=${aws_region}" \
+    -backend-config="encrypt=true" \
+    -backend-config="use_lockfile=true"
+backend_reconfiguration_exit=$?
+printf 'Guarded backend reconfiguration result: %s\n' \
+  "${backend_reconfiguration_exit}"
+test "${backend_reconfiguration_exit}" -eq 0
+```
+
+Require another refreshed zero-change plan before accepting the local
+transition. After reconfiguration succeeds, run the canonical
+[routine S3-backed verification](verify-state.md#routine-s3-backed-verification).
+Retain the preserved files until that verification returns exit code `0`.
+
+## Routine foundation changes
+
+The foundation remains a local, human-reviewed operation. First run the
+canonical [routine S3-backed verification](verify-state.md#routine-s3-backed-verification)
+and require exit code `0`. Continue in that zsh session without clearing its
+environment. The administration role can apply only changes allowed by its
+durable boundary and inline policy. Changes to IAM identity, OIDC trust, the
+HTTPS-only bucket policy or a durable boundary need a separate root-supervised
+bootstrap and security review.
+
+```zsh
+module_dir="infra/bootstrap"
+private_dir=".private/terraform-bootstrap"
+tfvars_file="${private_dir}/terraform.tfvars"
+plan_file="${private_dir}/account-foundation.tfplan"
+```
+
+Create and review one exact private plan. Never upload the binary plan to
+GitHub.
+
+```zsh
+test "${routine_verification_exit:-125}" -eq 0 && \
+  routine_apply_exit=125 && \
+  test ! -e "${plan_file}" && \
+  test ! -L "${plan_file}" && \
+  AWS_PROFILE=opensearch-lab-admin \
+    aws sts get-caller-identity --output json |
+  jq -e --arg account "${aws_account_id}" '
+    .Account == $account and
+    (.Arn | test("^arn:aws:sts::" + $account +
+      ":assumed-role/opensearch-lab-terraform-admin/[^/]+$"))
+  ' >/dev/null && \
+  AWS_PROFILE=opensearch-lab-admin \
+    terraform -chdir="${module_dir}" plan \
+    -var-file="../../${tfvars_file}" \
+    -out="../../${plan_file}" && \
+  chmod 600 "${plan_file}" && \
+  terraform -chdir="${module_dir}" show \
+    -no-color "../../${plan_file}"
+routine_change_plan_exit=$?
+printf 'Guarded routine-plan result: %s\n' \
+  "${routine_change_plan_exit}"
+test "${routine_change_plan_exit}" -eq 0
+```
+
+Apply only the reviewed saved plan, after checking the exact role again.
+
+```zsh
+test "${routine_change_plan_exit:-125}" -eq 0 && \
+  routine_change_plan_exit=125 && \
+  routine_verification_exit=125 && \
+  AWS_PROFILE=opensearch-lab-admin \
+  aws sts get-caller-identity --output json |
+  jq -e --arg account "${aws_account_id}" '
+    .Account == $account and
+    (.Arn | test("^arn:aws:sts::" + $account +
+      ":assumed-role/opensearch-lab-terraform-admin/[^/]+$"))
+  ' >/dev/null && \
+  AWS_PROFILE=opensearch-lab-admin \
+    terraform -chdir="${module_dir}" apply \
+    "../../${plan_file}"
+routine_apply_exit=$?
+printf 'Guarded routine apply result: %s\n' "${routine_apply_exit}"
+test "${routine_apply_exit}" -eq 0
+```
+
+After a successful apply, rerun the canonical
+[routine S3-backed verification](verify-state.md#routine-s3-backed-verification).
+It performs a new exact-role check and refresh-enabled plan. Remove the saved
+plan only after that verification records exit code `0`.
+
+```zsh
+test "${routine_apply_exit:-125}" -eq 0 && \
+  test "${routine_verification_exit:-125}" -eq 0 && \
+  rm -- "${plan_file}"
+```
+
+## Current and future automation boundaries
+
+GitHub Actions currently performs credential-free formatting, validation,
+mocked Terraform tests, renderer tests and repository security checks. The OIDC
+smoke workflow separately proves federation. Automated foundation apply is
+deferred.
+
+Any future Terraform workflow must use GitHub OIDC to assume its reviewed
+execution role before invoking Terraform. The resulting temporary credentials
+become ambient credentials for both the S3 backend and provider, so neither
+requires an `assume_role` block. The current GitHub Actions role is deliberately
+limited to state and lock access and cannot apply the foundation. Expanding or
+replacing that execution identity requires a separate design review.
+
+A future EKS workflow may create a plan from protected `main`, place the exact
+binary plan in a private short-lived S3 object, publish only a redacted summary,
+require protected Environment approval, download and apply that exact plan, and
+rely on lifecycle deletion. That design is planned and is not implemented here.
+
+Argo CD is also planned. It will reconcile Kubernetes workloads only after EKS
+exists. It will not manage Terraform infrastructure.
+
+For failures, use [Account bootstrap recovery](account-bootstrap-recovery.md).
+For rationale and trust boundaries, see [Bootstrap security and design](bootstrap-security.md).
+
+## Primary references
+
+- [AWS root user best practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/root-user-best-practices.html)
+- [AWS CLI sign-in with `aws login`](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sign-in.html)
+- [AWS IAM permissions boundaries](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_boundaries.html)
+- [AWS Free Tier plans](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/free-tier-plans.html)
+- [AWS Budgets best practices](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-best-practices.html)
+- [Terraform S3 backend](https://developer.hashicorp.com/terraform/language/backend/s3)
+- [Terraform backend initialisation](https://developer.hashicorp.com/terraform/cli/commands/init)
+- [Terraform saved plan application](https://developer.hashicorp.com/terraform/cli/commands/apply#saved-plan-mode)
+- [GitHub OIDC in AWS](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-aws)
+- [GitHub deployment environments](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
