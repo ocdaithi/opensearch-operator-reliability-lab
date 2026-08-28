@@ -3,12 +3,17 @@
 set -euo pipefail
 
 bootstrap_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-repository_root="$(git -C "${bootstrap_dir}" rev-parse --show-toplevel)"
 terraform_bin="${TERRAFORM_BIN:-terraform}"
+terraform_data_dir="${TF_DATA_DIR:-}"
 negative_case_count=0
 
-if ! compgen -G "${bootstrap_dir}/.terraform/providers/registry.terraform.io/hashicorp/aws/6.61.0/*/terraform-provider-aws_*" >/dev/null; then
-  printf 'Run terraform init -backend=false before the mutation tests.\n' >&2
+if [[ -z "${terraform_data_dir}" || "${terraform_data_dir}" != /* ]]; then
+  printf 'Set TF_DATA_DIR to an absolute, isolated Terraform data directory.\n' >&2
+  exit 1
+fi
+
+if ! compgen -G "${terraform_data_dir}/providers/registry.terraform.io/hashicorp/aws/6.61.0/*/terraform-provider-aws_*" >/dev/null; then
+  printf 'Run terraform init -backend=false with the isolated TF_DATA_DIR before the mutation tests.\n' >&2
   exit 1
 fi
 
@@ -45,7 +50,6 @@ copy_terraform_fixture() {
 
   cp "${bootstrap_dir}/.terraform.lock.hcl" "${fixture_dir}/"
   cp "${bootstrap_dir}/tests/security_contracts.tftest.hcl" "${fixture_dir}/tests/"
-  ln -s "${bootstrap_dir}/.terraform" "${fixture_dir}/.terraform"
 }
 
 apply_terraform_mutation() {
@@ -57,10 +61,19 @@ apply_terraform_mutation() {
 
   case "${case_name}" in
     wildcard-oidc-subject-with-ignore-changes)
-      perl -0pi -e 's#github_subject = "[^"]+"#github_subject = "repo:*"#' "${fixture_dir}/locals.tf"
+      perl -0pi -e 's#github_subject\s+= "[^"]+"#github_subject = "repo:*"#' "${fixture_dir}/locals.tf"
       perl -0pi -e 's/(resource "aws_iam_role" "github_actions" \{.*?max_session_duration = 3600\n)/$1\n  lifecycle {\n    ignore_changes = [assume_role_policy]\n  }\n/s' \
         "${fixture_dir}/github-oidc.tf"
       grep -Fq 'github_subject = "repo:*"' "${fixture_dir}/locals.tf"
+      grep -Fq 'ignore_changes = [assume_role_policy]' "${fixture_dir}/github-oidc.tf"
+      ;;
+    name-only-oidc-subject)
+      perl -0pi -e 's#github_subject\s+= "[^"]+"#github_subject = "repo:example-owner/example-repository:environment:aws-bootstrap"#' \
+        "${fixture_dir}/locals.tf"
+      perl -0pi -e 's/(resource "aws_iam_role" "github_actions" \{.*?max_session_duration = 3600\n)/$1\n  lifecycle {\n    ignore_changes = [assume_role_policy]\n  }\n/s' \
+        "${fixture_dir}/github-oidc.tf"
+      grep -Fq 'github_subject = "repo:example-owner/example-repository:environment:aws-bootstrap"' \
+        "${fixture_dir}/locals.tf"
       grep -Fq 'ignore_changes = [assume_role_policy]' "${fixture_dir}/github-oidc.tf"
       ;;
     broadened-human-trust-with-ignore-changes)
@@ -115,7 +128,7 @@ apply_terraform_mutation() {
       grep -Fq 'object_ownership = "ObjectWriter"' "${fixture_dir}/state.tf"
       ;;
     wrong-budget-name)
-      perl -0pi -e 's/budget_name\s+= "opensearch-lab-monthly-cost"/budget_name                   = "unsafe-budget-name"/' \
+      perl -0pi -e 's/budget_name\s+= "[^"]+"/budget_name                   = "unsafe-budget-name"/' \
         "${fixture_dir}/locals.tf"
       grep -Fq 'budget_name                   = "unsafe-budget-name"' \
         "${fixture_dir}/locals.tf"
@@ -149,6 +162,12 @@ apply_terraform_mutation() {
       grep -Fq 'primary_billing_view_arn     = "arn:aws:billing::' "${fixture_dir}/locals.tf"
       grep -Fq '["0000", "0000", "0000"])}:billingview/custom"' "${fixture_dir}/locals.tf"
       ;;
+    commercial-partition-broadening)
+      perl -0pi -e 's/data\.aws_partition\.current\.partition == "aws"/contains(["aws", "aws-cn"], data.aws_partition.current.partition)/' \
+        "${fixture_dir}/state.tf"
+      grep -Fq 'contains(["aws", "aws-cn"], data.aws_partition.current.partition)' \
+        "${fixture_dir}/state.tf"
+      ;;
     *)
       printf 'Unknown Terraform mutation case: %s\n' "${case_name}" >&2
       exit 1
@@ -159,6 +178,7 @@ apply_terraform_mutation() {
 run_terraform_negative() {
   local case_name="$1"
   local expected_error="$2"
+  local allowed_error_header="${3:-Error: Test assertion failed}"
   local fixture_dir="${mutation_root}/${case_name}"
   local test_log="${mutation_root}/${case_name}.log"
   local test_status
@@ -169,6 +189,7 @@ run_terraform_negative() {
   set +e
   AWS_EC2_METADATA_DISABLED=true \
     AWS_ENDPOINT_URL=http://127.0.0.1:9 \
+    TF_DATA_DIR="${terraform_data_dir}" \
     "${terraform_bin}" -chdir="${fixture_dir}" test -no-color >"${test_log}" 2>&1
   test_status=$?
   set -e
@@ -182,8 +203,8 @@ run_terraform_negative() {
     tail -40 "${test_log}" >&2
     exit 1
   fi
-  if awk '
-    /^Error:/ && $0 != "Error: Test assertion failed" { unexpected = 1 }
+  if awk -v allowed_error_header="${allowed_error_header}" '
+    /^Error:/ && $0 != allowed_error_header { unexpected = 1 }
     END { exit !unexpected }
   ' "${test_log}"; then
     printf 'FAIL %s: unrelated Terraform failure masked the mutation.\n' "${case_name}" >&2
@@ -200,8 +221,6 @@ copy_policy_fixture() {
   mkdir -p \
     "${fixture_dir}/infra/bootstrap/policies" \
     "${fixture_dir}/infra/bootstrap/scripts"
-  git -C "${fixture_dir}" init -q
-  cp "${repository_root}/.gitignore" "${fixture_dir}/.gitignore"
   cp "${bootstrap_dir}/policies/temporary-bootstrap-policy.template.json" \
     "${fixture_dir}/infra/bootstrap/policies/"
   cp "${bootstrap_dir}/policies/terraform-admin-boundary.template.json" \
@@ -211,8 +230,6 @@ copy_policy_fixture() {
   cp "${bootstrap_dir}/scripts/generate-temporary-policy.sh" \
     "${fixture_dir}/infra/bootstrap/scripts/"
   cp "${bootstrap_dir}/scripts/generate-permissions-boundaries.sh" \
-    "${fixture_dir}/infra/bootstrap/scripts/"
-  cp "${bootstrap_dir}/scripts/policy-contract-digest.sh" \
     "${fixture_dir}/infra/bootstrap/scripts/"
   cp "${bootstrap_dir}/scripts/test-generate-temporary-policy.sh" \
     "${fixture_dir}/infra/bootstrap/scripts/"
@@ -276,13 +293,9 @@ apply_policy_mutation() {
       jq -e 'any(.Statement[]; .Sid == "ManageStateBucketControls" and (.Action | index("s3:PutBucketPolicy") != null))' \
         "${human_boundary}" >/dev/null
       ;;
-    shorter-temporary-expiry)
-      perl -0pi -e 's/\. \+ 14400/\. + 3600/' "${generator}"
-      grep -Fq '. + 3600 | todateiso8601' "${generator}"
-      ;;
     longer-temporary-expiry)
-      perl -0pi -e 's/\. \+ 14400/\. + 28800/' "${generator}"
-      grep -Fq '. + 28800 | todateiso8601' "${generator}"
+      perl -0pi -e 's/lifetime_seconds=14400/lifetime_seconds=28800/' "${generator}"
+      grep -Fq 'lifetime_seconds=28800' "${generator}"
       ;;
     *)
       printf 'Unknown policy mutation case: %s\n' "${case_name}" >&2
@@ -322,9 +335,15 @@ run_policy_negative() {
 
 copy_static_fixture() {
   local fixture_dir="$1"
+  local source_file
 
   mkdir -p "${fixture_dir}/tests"
-  cp "${bootstrap_dir}"/*.tf "${fixture_dir}/"
+  for source_file in "${bootstrap_dir}"/*.tf; do
+    if [[ "$(basename "${source_file}")" != "backend.tf" ]]; then
+      cp "${source_file}" "${fixture_dir}/"
+    fi
+  done
+  cp "${bootstrap_dir}/backend.s3.tf.example" "${fixture_dir}/"
   cp "${bootstrap_dir}/tests/inspect-hcl-structure.py" "${fixture_dir}/tests/"
   cp "${bootstrap_dir}/tests/test-static-security-contracts.sh" "${fixture_dir}/tests/"
 }
@@ -370,6 +389,58 @@ run_structural_static_negative() {
         "${fixture_dir}/budget.tf"
       grep -Fq 'time_period_start = "2099-01-01_00:00"' \
         "${fixture_dir}/budget.tf"
+      ;;
+    provider-assume-role)
+      perl -0pi -e 's#(provider "aws" \{\n)#$1  assume_role {\n    role_arn = "arn:aws:iam::0000:role/unsafe"\n  }\n\n#' \
+        "${fixture_dir}/providers.tf"
+      grep -Fq 'assume_role {' "${fixture_dir}/providers.tf"
+      ;;
+    provider-assume-role-with-web-identity)
+      perl -0pi -e 's#(provider "aws" \{\n)#$1  assume_role_with_web_identity {\n    role_arn                = "arn:aws:iam::0000:role/unsafe"\n    web_identity_token_file = "/tmp/synthetic-token"\n  }\n\n#' \
+        "${fixture_dir}/providers.tf"
+      grep -Fq 'assume_role_with_web_identity {' "${fixture_dir}/providers.tf"
+      ;;
+    provider-profile)
+      perl -0pi -e 's#(provider "aws" \{\n)#$1  profile = "unsafe-profile"\n#' \
+        "${fixture_dir}/providers.tf"
+      grep -Fq 'profile = "unsafe-profile"' "${fixture_dir}/providers.tf"
+      ;;
+    backend-example-profile)
+      perl -0pi -e 's/backend "s3" \{\}/backend "s3" {\n    profile = "unsafe-profile"\n  }/' \
+        "${fixture_dir}/backend.s3.tf.example"
+      grep -Fq 'profile = "unsafe-profile"' \
+        "${fixture_dir}/backend.s3.tf.example"
+      ;;
+    backend-example-role-assumption)
+      perl -0pi -e 's#backend "s3" \{\}#backend "s3" {\n    assume_role = {\n      role_arn = "arn:aws:iam::0000:role/unsafe"\n    }\n  }#' \
+        "${fixture_dir}/backend.s3.tf.example"
+      grep -Fq 'assume_role = {' "${fixture_dir}/backend.s3.tf.example"
+      ;;
+    budget-email-default)
+      perl -0pi -e 's/(variable "budget_notification_email" \{.*?sensitive\s+= true\n)/$1  default     = "alerts\@example.invalid"\n/s' \
+        "${fixture_dir}/variables.tf"
+      grep -Fq 'default     = "alerts@example.invalid"' \
+        "${fixture_dir}/variables.tf"
+      ;;
+    budget-email-commented-default)
+      perl -0pi -e 's/(variable "budget_notification_email" \{.*?sensitive\s+= true\n)/$1  default \/* reviewed *\/ = "alerts\@example.invalid"\n/s' \
+        "${fixture_dir}/variables.tf"
+      grep -Fq 'default /* reviewed */ = "alerts@example.invalid"' \
+        "${fixture_dir}/variables.tf"
+      ;;
+    hard-coded-provider-region)
+      perl -0pi -e 's/region\s+= var\.aws_region/region = "eu-west-1"/' \
+        "${fixture_dir}/providers.tf"
+      grep -Fq 'region = "eu-west-1"' "${fixture_dir}/providers.tf"
+      ;;
+    removed-account-allow-list)
+      perl -0pi -e 's/^  allowed_account_ids = \[var\.expected_aws_account_id\]\n//m' \
+        "${fixture_dir}/providers.tf"
+      if grep -Fq 'allowed_account_ids' "${fixture_dir}/providers.tf"; then
+        printf 'FAIL %s: the account allow-list mutation was not applied.\n' \
+          "${case_name}" >&2
+        exit 1
+      fi
       ;;
     *)
       printf 'Unknown structural mutation case: %s\n' "${case_name}" >&2
@@ -522,9 +593,31 @@ run_destroy_guard_decoy_negative() {
   local test_log="${mutation_root}/${case_name}.log"
 
   copy_static_fixture "${fixture_dir}"
-  perl -0pi -e 's/  lifecycle \{\n    prevent_destroy = true\n  \}/  tags = {\n    Decoy = <<-EOT\n      lifecycle {\n        prevent_destroy = true\n      }\n    EOT\n  }/' \
+  perl -0pi -e 's/(resource "aws_s3_bucket" "state" \{.*?lifecycle \{\n)    prevent_destroy = true\n/$1/s' \
     "${fixture_dir}/state.tf"
-  grep -Fq '    Decoy = <<-EOT' "${fixture_dir}/state.tf"
+  printf '%s\n' \
+    '' \
+    'locals {' \
+    '  destroy_guard_decoy = <<-EOT' \
+    '    lifecycle {' \
+    '      prevent_destroy = true' \
+    '    }' \
+    '  EOT' \
+    '}' >>"${fixture_dir}/state.tf"
+  if python3 "${fixture_dir}/tests/inspect-hcl-structure.py" \
+    "${fixture_dir}/state.tf" | jq -e '
+      any(
+        .attributes[];
+        .resource == "aws_s3_bucket.state" and
+        .parents == ["resource", "lifecycle"] and
+        .name == "prevent_destroy"
+      )
+    ' >/dev/null; then
+    printf 'FAIL %s: the state-bucket guard mutation was not applied.\n' \
+      "${case_name}" >&2
+    exit 1
+  fi
+  grep -Fq '  destroy_guard_decoy = <<-EOT' "${fixture_dir}/state.tf"
   test "$(grep -Fc 'prevent_destroy = true' "${fixture_dir}/state.tf")" -eq 7
   assert_mutated_hcl_parses "${case_name}" "${fixture_dir}"
 
@@ -575,6 +668,9 @@ run_terraform_negative \
   wildcard-oidc-subject-with-ignore-changes \
   'The raw GitHub trust-policy document must match the exact reviewed contract.'
 run_terraform_negative \
+  name-only-oidc-subject \
+  'The raw GitHub trust-policy document must match the exact reviewed contract.'
+run_terraform_negative \
   broadened-human-trust-with-ignore-changes \
   'The raw human trust-policy document must match the exact reviewed contract.'
 run_terraform_negative \
@@ -616,6 +712,10 @@ run_terraform_negative \
 run_terraform_negative \
   billing-view-custom-arn \
   'primary billing-view ARN.'
+run_terraform_negative \
+  commercial-partition-broadening \
+  'Missing expected failure' \
+  'Error: Missing expected failure'
 
 run_boundary_assignment_negative \
   replaced-human-boundary \
@@ -633,35 +733,31 @@ run_boundary_assignment_negative \
 run_policy_negative \
   extra-temporary-action \
   test-generate-temporary-policy.sh \
-  'The temporary policy template differs from its exact reviewed contract.'
+  'Temporary policy failed its security contract.'
 run_policy_negative \
   extra-temporary-statement \
   test-generate-temporary-policy.sh \
-  'The temporary policy template differs from its exact reviewed contract.'
+  'Temporary policy failed its security contract.'
 run_policy_negative \
   removed-temporary-expiry \
   test-generate-temporary-policy.sh \
-  'The temporary policy template differs from its exact reviewed contract.'
+  'Temporary policy failed its security contract.'
 run_policy_negative \
   broadened-temporary-resource \
   test-generate-temporary-policy.sh \
-  'The temporary policy template differs from its exact reviewed contract.'
+  'Temporary policy failed its security contract.'
 run_policy_negative \
   extra-github-boundary-action \
   test-generate-permissions-boundaries.sh \
-  'A permissions-boundary template differs from its exact reviewed contract.'
+  'GitHub Actions boundary failed its security contract.'
 run_policy_negative \
   reintroduced-human-boundary-bucket-policy \
   test-generate-permissions-boundaries.sh \
-  'A permissions-boundary template differs from its exact reviewed contract.'
-run_policy_negative \
-  shorter-temporary-expiry \
-  test-generate-temporary-policy.sh \
-  'Temporary policy exact contract failed.'
+  'Terraform administration boundary failed its security contract.'
 run_policy_negative \
   longer-temporary-expiry \
   test-generate-temporary-policy.sh \
-  'Temporary policy exact contract failed.'
+  'Temporary policy lifetime must not exceed four hours.'
 
 run_reintroduced_user_policy_negative
 run_indented_runtime_resource_negative
@@ -680,8 +776,35 @@ run_structural_static_negative \
 run_structural_static_negative \
   future-budget-start \
   'The account budget must omit optional activation, billing-view and adjustment settings.'
+run_structural_static_negative \
+  provider-assume-role \
+  'The AWS provider must use only the exact ambient-credential configuration.'
+run_structural_static_negative \
+  provider-assume-role-with-web-identity \
+  'The AWS provider must use only the exact ambient-credential configuration.'
+run_structural_static_negative \
+  provider-profile \
+  'The AWS provider must use only the exact ambient-credential configuration.'
+run_structural_static_negative \
+  backend-example-profile \
+  'The partial S3 backend example must contain no credential, profile or role-assumption configuration.'
+run_structural_static_negative \
+  backend-example-role-assumption \
+  'The partial S3 backend example must contain no credential, profile or role-assumption configuration.'
+run_structural_static_negative \
+  budget-email-default \
+  'The budget notification email must be sensitive and have no tracked default.'
+run_structural_static_negative \
+  budget-email-commented-default \
+  'The budget notification email must be sensitive and have no tracked default.'
+run_structural_static_negative \
+  hard-coded-provider-region \
+  'The AWS provider must use the exact region and expected account inputs.'
+run_structural_static_negative \
+  removed-account-allow-list \
+  'The AWS provider must use the exact region and expected account inputs.'
 run_budget_destroy_guard_negative
 run_destroy_guard_decoy_negative
 run_lifecycle_filter_negative
 
-printf 'Security-contract mutations detected: %d/35.\n' "${negative_case_count}"
+printf 'Security-contract mutations detected: %d/45.\n' "${negative_case_count}"

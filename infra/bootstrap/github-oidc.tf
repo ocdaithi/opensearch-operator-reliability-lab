@@ -39,7 +39,7 @@ resource "aws_iam_role" "github_actions" {
 }
 
 resource "aws_iam_role_policy" "github_actions_state" {
-  name   = "opensearch-lab-bootstrap-state"
+  name   = local.github_actions_policy_name
   role   = aws_iam_role.github_actions.id
   policy = data.aws_iam_policy_document.state_backend_access.json
 }

@@ -156,7 +156,7 @@ def inspect(path: Path) -> dict[str, list[dict[str, object]]]:
                     result["modules"].append(
                         {"name": labels[0], "file": str(path), "line": token.line}
                     )
-                if resource and stack:
+                if stack:
                     result["blocks"].append(
                         {
                             "type": token.value,
@@ -184,20 +184,22 @@ def inspect(path: Path) -> dict[str, list[dict[str, object]]]:
                 index = cursor + 1
                 continue
 
-            if (
-                index + 1 < len(tokens)
-                and tokens[index + 1].kind == "="
-                and (resource := next(
+            if index + 1 < len(tokens) and tokens[index + 1].kind == "=":
+                resource = next(
                     (frame.resource for frame in reversed(stack) if frame.resource),
                     None,
-                ))
-            ):
+                )
                 result["attributes"].append(
                     {
                         "name": token.value,
                         "resource": resource,
                         "parents": [
                             frame.block_type
+                            for frame in stack
+                            if frame.block_type is not None
+                        ],
+                        "parent_labels": [
+                            list(frame.labels)
                             for frame in stack
                             if frame.block_type is not None
                         ],

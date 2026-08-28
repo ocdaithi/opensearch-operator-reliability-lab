@@ -6,7 +6,7 @@ data "aws_iam_policy_document" "state_object_access" {
       "s3:GetObject",
       "s3:PutObject",
     ]
-    resources = ["${aws_s3_bucket.state.arn}/${local.state_key}"]
+    resources = ["${local.state_bucket_arn}/${local.state_key}"]
   }
 
   statement {
@@ -17,7 +17,7 @@ data "aws_iam_policy_document" "state_object_access" {
       "s3:GetObject",
       "s3:PutObject",
     ]
-    resources = ["${aws_s3_bucket.state.arn}/${local.state_key}.tflock"]
+    resources = ["${local.state_bucket_arn}/${local.lock_key}"]
   }
 }
 
@@ -28,14 +28,14 @@ data "aws_iam_policy_document" "state_backend_access" {
     sid       = "ListExactTerraformStateKeys"
     effect    = "Allow"
     actions   = ["s3:ListBucket"]
-    resources = [aws_s3_bucket.state.arn]
+    resources = [local.state_bucket_arn]
 
     condition {
       test     = "StringEquals"
       variable = "s3:prefix"
       values = [
         local.state_key,
-        "${local.state_key}.tflock",
+        local.lock_key,
       ]
     }
   }

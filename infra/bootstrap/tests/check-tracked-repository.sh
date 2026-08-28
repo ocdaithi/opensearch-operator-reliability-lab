@@ -2,16 +2,18 @@
 
 set -euo pipefail
 
-if (($# != 0)); then
-  echo "This command does not accept arguments." >&2
+fail() {
+  printf '%s\n' "$1" >&2
   exit 1
+}
+
+if (($# != 0)); then
+  fail "This command does not accept arguments."
 fi
 
-for command_name in awk git grep jq tr unzip; do
-  if ! command -v "${command_name}" >/dev/null 2>&1; then
-    echo "Required command is unavailable: ${command_name}" >&2
-    exit 1
-  fi
+for command_name in git grep; do
+  command -v "${command_name}" >/dev/null 2>&1 ||
+    fail "Required command is unavailable: ${command_name}"
 done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,59 +22,31 @@ cd "${repository_root}"
 
 validation_workflow=".github/workflows/terraform-validate.yml"
 oidc_workflow=".github/workflows/verify-aws-oidc.yml"
+bootstrap_runbook="docs/aws/account-bootstrap.md"
+verification_runbook="docs/aws/verify-state.md"
+security_document="docs/aws/bootstrap-security.md"
+recovery_runbook="docs/aws/account-bootstrap-recovery.md"
+bootstrap_article="docs/articles/aws-account-bootstrap-with-terraform.md"
 
-trim_whitespace() {
-  local value="$1"
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  printf '%s' "${value}"
-}
+required_documents=(
+  README.md
+  "${bootstrap_runbook}"
+  "${verification_runbook}"
+  "${security_document}"
+  "${recovery_runbook}"
+  "${bootstrap_article}"
+)
 
-binary_file_has_markers() {
-  local tracked_file="$1"
-  local marker
-  shift
-
-  for marker in "$@"; do
-    if ! grep -aFq -- "${marker}" "./${tracked_file}"; then
-      return 1
-    fi
-  done
-
-  return 0
-}
-
-check_archive_entry() {
-  local archive_entry="${1#./}"
-
-  [[ -n "${archive_entry}" ]] || return
-  [[ "${archive_entry}" == */ ]] && return
-
-  case "${archive_entry}" in
-    kubeconfig.example | */kubeconfig.example | *.kubeconfig.example)
-      ;;
-    .kube/* | */.kube/* | kubeconfig | */kubeconfig | \
-      kubeconfig.* | */kubeconfig.* | *.kubeconfig)
-      echo "An archive contains a prohibited kubeconfig." >&2
-      exit 1
-      ;;
-    .private/* | */.private/* | .aws/* | */.aws/* | \
-      .terraform/* | */.terraform/* | backend.tf | */backend.tf | \
-      *.tfstate | *.tfstate.* | *.tfplan | tfplan | */tfplan | \
-      *.tfvars | *.tfvars.json | temporary-bootstrap-policy.json | \
-      */temporary-bootstrap-policy.json)
-      echo "An archive contains a prohibited generated, private, state or plan artefact." >&2
-      exit 1
-      ;;
-  esac
-}
+for required_document in "${required_documents[@]}"; do
+  [[ -f "${required_document}" && ! -L "${required_document}" ]] ||
+    fail "Required documentation is not a regular file: ${required_document}"
+done
 
 for required_workflow in "${validation_workflow}" "${oidc_workflow}"; do
-  if ! git ls-files --error-unmatch "${required_workflow}" >/dev/null 2>&1 ||
-    [[ ! -f "${required_workflow}" ]] || [[ -L "${required_workflow}" ]]; then
-    echo "A reviewed workflow is not a tracked regular file." >&2
-    exit 1
-  fi
+  git ls-files --error-unmatch -- "${required_workflow}" >/dev/null 2>&1 ||
+    fail "Required workflow is not tracked: ${required_workflow}"
+  [[ -f "${required_workflow}" && ! -L "${required_workflow}" ]] ||
+    fail "Required workflow is not a tracked regular file: ${required_workflow}"
 done
 
 tracked_file_count=0
@@ -80,477 +54,209 @@ while IFS= read -r -d '' tracked_file; do
   tracked_file_count=$((tracked_file_count + 1))
 
   case "${tracked_file}" in
-    kubeconfig.example | */kubeconfig.example | *.kubeconfig.example)
-      ;;
     .kube/* | */.kube/* | kubeconfig | */kubeconfig | \
       kubeconfig.* | */kubeconfig.* | *.kubeconfig)
-      echo "A kubeconfig is tracked." >&2
-      exit 1
+      fail "A kubeconfig is tracked: ${tracked_file}"
       ;;
     .private/* | */.private/* | .aws/* | */.aws/* | \
       .terraform/* | */.terraform/* | backend.tf | */backend.tf | \
-      *.tfstate | *.tfstate.* | *.tfplan | tfplan | */tfplan | \
       *.tfvars | *.tfvars.json | temporary-bootstrap-policy.json | \
       */temporary-bootstrap-policy.json)
-      echo "A generated, private, state or plan artefact is tracked." >&2
-      exit 1
+      fail "A private or generated Terraform file is tracked: ${tracked_file}"
+      ;;
+    *.tfstate | *.tfstate.* | *.tfplan | tfplan | */tfplan)
+      fail "A Terraform state or plan artefact is tracked: ${tracked_file}"
       ;;
   esac
-
-  if [[ -f "${tracked_file}" ]] && [[ ! -L "${tracked_file}" ]] && jq -e '
-    type == "object"
-    and has("version")
-    and has("terraform_version")
-    and has("serial")
-    and has("lineage")
-    and has("resources")
-  ' "${tracked_file}" >/dev/null 2>&1; then
-    echo "Terraform state content is tracked under a disguised filename." >&2
-    exit 1
-  fi
-
-  if [[ -f "${tracked_file}" ]] && [[ ! -L "${tracked_file}" ]] && {
-    jq -e '
-      type == "object"
-      and .apiVersion == "v1"
-      and .kind == "Config"
-      and (.clusters | type == "array")
-      and (.contexts | type == "array")
-      and (.users | type == "array")
-      and has("current-context")
-    ' "${tracked_file}" >/dev/null 2>&1 ||
-      awk '
-        /^[[:space:]]*apiVersion:[[:space:]]*v1[[:space:]]*$/ { api_version = 1 }
-        /^[[:space:]]*kind:[[:space:]]*Config[[:space:]]*$/ { kind = 1 }
-        /^[[:space:]]*clusters:[[:space:]]*($|\[)/ { clusters = 1 }
-        /^[[:space:]]*contexts:[[:space:]]*($|\[)/ { contexts = 1 }
-        /^[[:space:]]*current-context:[[:space:]]*/ { current_context = 1 }
-        /^[[:space:]]*users:[[:space:]]*($|\[)/ { users = 1 }
-        END {
-          exit !(api_version && kind && clusters && contexts && current_context && users)
-        }
-      ' "${tracked_file}"
-  }; then
-    echo "Kubeconfig content is tracked under a disguised filename." >&2
-    exit 1
-  fi
-
-  if [[ -f "${tracked_file}" ]] && [[ ! -L "${tracked_file}" ]] && jq -e '
-    type == "object"
-    and has("format_version")
-    and has("terraform_version")
-    and has("planned_values")
-    and has("resource_changes")
-    and has("configuration")
-  ' "${tracked_file}" >/dev/null 2>&1; then
-    echo "Terraform plan JSON is tracked under a disguised filename." >&2
-    exit 1
-  fi
-
-  if [[ -f "${tracked_file}" ]] && [[ ! -L "${tracked_file}" ]] &&
-    ! grep -Iq '' "./${tracked_file}"; then
-    if binary_file_has_markers "${tracked_file}" \
-      '"version"' '"terraform_version"' '"serial"' '"lineage"' \
-      '"resources"'; then
-      echo "Terraform state content is tracked in a binary-classified file." >&2
-      exit 1
-    fi
-    if binary_file_has_markers "${tracked_file}" \
-      '"format_version"' '"terraform_version"' '"planned_values"' \
-      '"resource_changes"' '"configuration"'; then
-      echo "Terraform plan content is tracked in a binary-classified file." >&2
-      exit 1
-    fi
-  fi
-
-  if [[ -f "${tracked_file}" ]] && [[ ! -L "${tracked_file}" ]]; then
-    archive_entries="$(unzip -Z1 "./${tracked_file}" 2>/dev/null || true)"
-    if grep -Fqx 'tfplan' <<<"${archive_entries}" &&
-      grep -Fqx 'tfstate' <<<"${archive_entries}" &&
-      grep -Fqx 'tfstate-prev' <<<"${archive_entries}"; then
-      echo "A Terraform plan archive is tracked under a disguised filename." >&2
-      exit 1
-    fi
-    if [[ -n "${archive_entries}" ]]; then
-      while IFS= read -r archive_entry; do
-        check_archive_entry "${archive_entry}"
-      done <<<"${archive_entries}"
-    fi
-  fi
 done < <(git ls-files -z)
 
-if ((tracked_file_count == 0)); then
-  echo "The repository has no tracked files to inspect." >&2
-  exit 1
+content_pathspecs=(
+  .
+  ':(exclude)infra/bootstrap/tests/check-tracked-repository.sh'
+  ':(exclude)infra/bootstrap/tests/test-tracked-repository.sh'
+)
+
+if git grep -I -q -E -e 'arn:aws:iam::[[:digit:]]{12}:' -- \
+  "${content_pathspecs[@]}"; then
+  fail "A tracked file contains an account-specific IAM ARN."
 fi
 
-if git grep -a -qE 'arn:[a-z0-9-]+:iam::[0-9]{12}:' -- .; then
-  echo "An account-specific IAM ARN is present in tracked content." >&2
-  exit 1
+if git grep -I -q -E \
+  -e '(^|[^[:digit:]])[[:digit:]]{12}([^[:digit:]]|$)' -- \
+  "${content_pathspecs[@]}"; then
+  fail "A tracked file contains a possible AWS account ID."
 fi
 
-if git grep -a -qE '(^|[^[:alnum:]])[0-9]{12}([^[:alnum:]]|$)' -- .; then
-  echo "A possible AWS account ID is present in tracked content." >&2
-  exit 1
+if git grep -I -q -E -e '(AKIA|ASIA)[A-Z0-9]{16}' -- \
+  "${content_pathspecs[@]}"; then
+  fail "A tracked file contains an AWS access-key identifier."
 fi
 
-if git grep -a -qE '(^|[^A-Z0-9])(A3T[A-Z0-9]|ABIA|ACCA|AGPA|AIDA|AIPA|AKIA|ANPA|ANVA|AROA|ASCA|ASIA)[A-Z0-9]{16}([^A-Z0-9]|$)' -- .; then
-  echo "An AWS access-key identifier is present in tracked content." >&2
-  exit 1
+if git grep -I -q -E \
+  -e '(^|[^[:alnum:]_])(AWS_SECRET_ACCESS_KEY|aws_secret_access_key)[[:space:]]*[:=]' -- \
+  "${content_pathspecs[@]}"; then
+  fail "A tracked file contains a secret-access-key assignment."
 fi
 
-secret_key_name_lower="$(printf '%s%s' aws_secret_ access_key)"
-secret_key_name_upper="$(printf '%s%s' AWS_SECRET_ ACCESS_KEY)"
-secret_assignment_pattern="[\"']?(${secret_key_name_lower}|${secret_key_name_upper})[\"']?[[:space:]]*[:=]"
-if git grep -a -qE "${secret_assignment_pattern}" -- .; then
-  echo "An AWS secret-access-key assignment is present in tracked content." >&2
-  exit 1
+if git grep -I -q -E \
+  -e '-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----' -- \
+  "${content_pathspecs[@]}"; then
+  fail "A tracked file contains a private key."
 fi
 
-if git grep -a -qE '(^|[^[:alnum:]_])(gh[pousr]_[[:alnum:]]{36,}|github_pat_[[:alnum:]_]{20,})([^[:alnum:]_]|$)' -- .; then
-  echo "A GitHub token is present in tracked content." >&2
-  exit 1
-fi
+workflow_files=()
+while IFS= read -r workflow_file; do
+  [[ -n "${workflow_file}" ]] && workflow_files+=("${workflow_file}")
+done < <(git ls-files -- '.github/workflows/*.yml' '.github/workflows/*.yaml')
 
-private_key_label="$(printf '%s%s' PRIVATE ' KEY')"
-private_key_types="$(printf '%s%s' 'RSA|EC|DSA|ENCRYPTED|OPEN' SSH)"
-key_marker_pattern="-----BEGIN ((${private_key_types}) )?${private_key_label}-----"
-if git grep -a -qE -e "${key_marker_pattern}" -- .; then
-  echo "A private key is present in tracked content." >&2
-  exit 1
-fi
+((${#workflow_files[@]} > 0)) || fail "No tracked GitHub Actions workflows were found."
 
-expected_validation_trigger=$'on:\n  pull_request:\n  push:\n    branches:\n      - main'
-actual_validation_trigger="$(awk '
-  /^on:$/ { capture = 1 }
-  /^permissions:$/ { capture = 0 }
-  capture { print }
-' "${validation_workflow}")"
-if [[ "${actual_validation_trigger}" != "${expected_validation_trigger}" ]]; then
-  echo "The validation workflow trigger differs from the reviewed contract." >&2
-  exit 1
-fi
+for workflow_file in "${workflow_files[@]}"; do
+  [[ -f "${workflow_file}" && ! -L "${workflow_file}" ]] ||
+    fail "A tracked workflow is not a regular file: ${workflow_file}"
 
-expected_oidc_trigger=$'on:\n  workflow_dispatch:'
-actual_oidc_trigger="$(awk '
-  /^on:$/ { capture = 1 }
-  /^permissions:$/ { capture = 0 }
-  capture { print }
-' "${oidc_workflow}")"
-if [[ "${actual_oidc_trigger}" != "${expected_oidc_trigger}" ]]; then
-  echo "The AWS OIDC workflow must remain manually dispatched." >&2
-  exit 1
-fi
+  workflow_content="$(<"${workflow_file}")"
+  top_permissions_count="$(grep -Ec '^permissions:$' "${workflow_file}" || true)"
+  top_permission_entries="$(
+    grep -Ec '^  [[:alnum:]_-]+:[[:space:]]+(read|write|none)$' \
+      "${workflow_file}" || true
+  )"
 
-workflow_count=0
-action_count=0
-runner_count=0
-expected_read_only_permissions=$'permissions:\n  contents: read'
-expected_oidc_permissions=$'permissions:\n  contents: none'
-expected_oidc_guard_job=$'  guard:\n    name: Require the reviewed branch\n    if: always()\n    runs-on: ubuntu-24.04\n    timeout-minutes: 1\n\n    steps:\n      - name: Reject non-main dispatches\n        run: |\n          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then\n            echo "AWS OIDC verification is restricted to refs/heads/main." >&2\n            exit 1\n          fi'
-expected_oidc_job_permissions=$'    permissions:\n      id-token: write'
-local_action_stack="|"
-visited_local_actions="|"
-uses_pattern="^[[:space:]]*(-[[:space:]]+)?([\"']?uses[\"']?)[[:space:]]*:"
+  [[ "${top_permissions_count}" == "1" && \
+    "${top_permission_entries}" == "1" ]] ||
+    fail "Workflow must declare one minimal top-level permissions block: ${workflow_file}"
 
-extract_job_block() {
-  local yaml_file="$1"
-  local job_id="$2"
-
-  awk -v expected_job_id="${job_id}" '
-    /^jobs:$/ {
-      in_jobs = 1
-      next
-    }
-    in_jobs && /^[^[:space:]#]/ { exit }
-    in_jobs && /^  [A-Za-z0-9_-]+:[[:space:]]*(#.*)?$/ {
-      if (capture) {
-        exit
-      }
-      candidate = $0
-      sub(/^  /, "", candidate)
-      sub(/:.*/, "", candidate)
-      capture = candidate == expected_job_id
-    }
-    capture { print }
-  ' "${yaml_file}"
-}
-
-check_oidc_workflow_jobs() {
-  local actual_guard_job
-  local actual_job_ids
-  local actual_verify_permissions
-  local environment_count
-  local job_permissions_count
-  local verify_job
-
-  actual_job_ids="$(awk '
-    /^jobs:$/ {
-      in_jobs = 1
-      next
-    }
-    in_jobs && /^[^[:space:]#]/ { in_jobs = 0 }
-    in_jobs && /^  [A-Za-z0-9_-]+:[[:space:]]*(#.*)?$/ {
-      job_id = $0
-      sub(/^  /, "", job_id)
-      sub(/:.*/, "", job_id)
-      print job_id
-    }
-  ' "${oidc_workflow}")"
-  if [[ "${actual_job_ids}" != $'guard\nverify' ]]; then
-    echo "The manual AWS OIDC workflow must contain only the reviewed guard and verification jobs." >&2
-    exit 1
-  fi
-
-  actual_guard_job="$(extract_job_block "${oidc_workflow}" guard)"
-  if [[ "${actual_guard_job}" != "${expected_oidc_guard_job}" ]]; then
-    echo "The manual AWS OIDC workflow guard differs from its reviewed fail-closed contract." >&2
-    exit 1
-  fi
-
-  verify_job="$(extract_job_block "${oidc_workflow}" verify)"
-  if [[ "$(grep -Fxc '    needs: guard' <<<"${verify_job}" || true)" != "1" ]] ||
-    grep -Eq '^    if:' <<<"${verify_job}"; then
-    echo "The AWS credential job must depend only on the successful guard." >&2
-    exit 1
-  fi
-
-  job_permissions_count="$(grep -Ec '^    permissions:' "${oidc_workflow}" || true)"
-  actual_verify_permissions="$(awk '
-    /^    permissions:$/ {
-      capture = 1
-      print
-      next
-    }
-    capture && /^    [^[:space:]]/ { exit }
-    capture { print }
-  ' <<<"${verify_job}")"
-  if [[ "${job_permissions_count}" != "1" ]] ||
-    [[ "${actual_verify_permissions}" != "${expected_oidc_job_permissions}" ]]; then
-    echo "Only the AWS credential job may receive the reviewed ID-token permission." >&2
-    exit 1
-  fi
-
-  environment_count="$(grep -Ec '^    environment:' "${oidc_workflow}" || true)"
-  if [[ "${environment_count}" != "1" ]] ||
-    [[ "$(grep -Fxc '    environment: aws-bootstrap' <<<"${verify_job}" || true)" != "1" ]]; then
-    echo "Only the AWS credential job may use the aws-bootstrap environment." >&2
-    exit 1
-  fi
-}
-
-check_restricted_yaml_keys() {
-  local yaml_file="$1"
-
-  if grep -Eq "^[[:space:]]*(-[[:space:]]+)?[\"'].*[\"'][[:space:]]*:" \
-    "${yaml_file}" || grep -Eq '^[[:space:]]*\?' "${yaml_file}"; then
-    echo "Quoted or complex YAML mapping keys are not allowed in workflows or actions." >&2
-    exit 1
-  fi
-  if grep -Eq '^[[:space:]]*(-[[:space:]]+)?[!&*]' "${yaml_file}" ||
-    grep -Eq ':[[:space:]]*[!&*]' "${yaml_file}"; then
-    echo "YAML tags, anchors and aliases are not allowed in workflows or actions." >&2
-    exit 1
-  fi
-  if grep -Eq '^[[:space:]]*\{' "${yaml_file}" ||
-    grep -Eq '^[[:space:]]*([^#[:space:]][^:]*:[[:space:]]*|-[[:space:]]*)\{' \
-      "${yaml_file}"; then
-    echo "Flow-style YAML mappings are not allowed in workflows or actions." >&2
-    exit 1
-  fi
-}
-
-extract_action_reference() {
-  local uses_line="$1"
-  local action_reference="${uses_line#*:}"
-  action_reference="${action_reference%%#*}"
-  trim_whitespace "${action_reference}"
-}
-
-check_action_metadata_file() {
-  local metadata_file="$1"
-  local previous_stack
-  local uses_line
-
-  if [[ ! -f "${metadata_file}" ]] || [[ -L "${metadata_file}" ]]; then
-    echo "A local action metadata file is not a tracked regular file." >&2
-    exit 1
-  fi
-  if [[ "${local_action_stack}" == *"|${metadata_file}|"* ]]; then
-    echo "A local composite action reference cycle is not allowed." >&2
-    exit 1
-  fi
-  if [[ "${visited_local_actions}" == *"|${metadata_file}|"* ]]; then
-    return
-  fi
-
-  previous_stack="${local_action_stack}"
-  local_action_stack="${local_action_stack}${metadata_file}|"
-  check_restricted_yaml_keys "${metadata_file}"
-  while IFS= read -r uses_line; do
-    check_action_reference "$(extract_action_reference "${uses_line}")"
-  done < <(grep -E "${uses_pattern}" "${metadata_file}" || true)
-  local_action_stack="${previous_stack}"
-  visited_local_actions="${visited_local_actions}${metadata_file}|"
-}
-
-check_action_reference() {
-  local action_reference="$1"
-  local action_repository
-  local local_reference
-  local metadata_file=""
-
-  action_count=$((action_count + 1))
-
-  action_repository="$(printf '%s' "${action_reference%%@*}" | \
-    tr '[:upper:]' '[:lower:]')"
-  case "${action_repository}" in
-    actions/upload-artifact | actions/upload-artifact/* | \
-      actions/upload-pages-artifact | actions/upload-pages-artifact/*)
-      echo "Artifact upload actions require an explicit reviewed allow-list." >&2
-      exit 1
+  case "${workflow_file}" in
+    "${validation_workflow}")
+      [[ "${workflow_content}" == *$'permissions:\n  contents: read'* ]] ||
+        fail "Validation workflow must keep contents: read."
+      ;;
+    "${oidc_workflow}")
+      [[ "${workflow_content}" == *$'permissions:\n  contents: none'* ]] ||
+        fail "OIDC workflow must keep contents: none."
+      ;;
+    *)
+      if [[ "${workflow_content}" != *$'permissions:\n  contents: read'* && \
+        "${workflow_content}" != *$'permissions:\n  contents: none'* ]]; then
+        fail "Workflow must use contents: read or contents: none: ${workflow_file}"
+      fi
       ;;
   esac
 
-  if [[ "${action_reference}" == ./* ]]; then
-    local_reference="${action_reference#./}"
-    if [[ ! "${local_reference}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] ||
-      [[ "/${local_reference}/" == *"/../"* ]] ||
-      [[ "/${local_reference}/" == *"/./"* ]]; then
-      echo "A local workflow action reference is invalid or escapes its reviewed path." >&2
-      exit 1
-    fi
+  job_permissions_count="$(
+    grep -Ec '^[[:space:]]+permissions:' "${workflow_file}" || true
+  )"
+  id_token_count="$(grep -Fc 'id-token: write' "${workflow_file}" || true)"
 
-    case "${local_reference}" in
-      .github/workflows/*.yml | .github/workflows/*.yaml)
-        if ! git ls-files --error-unmatch "${local_reference}" >/dev/null 2>&1 ||
-          [[ ! -f "${local_reference}" ]] || [[ -L "${local_reference}" ]]; then
-          echo "A local reusable workflow reference is not a tracked regular file." >&2
-          exit 1
-        fi
-        return
-        ;;
-    esac
-
-    if git ls-files --error-unmatch \
-      "${local_reference}/action.yml" >/dev/null 2>&1; then
-      metadata_file="${local_reference}/action.yml"
-    fi
-    if git ls-files --error-unmatch \
-      "${local_reference}/action.yaml" >/dev/null 2>&1; then
-      if [[ -n "${metadata_file}" ]]; then
-        echo "A local action directory has ambiguous tracked metadata." >&2
-        exit 1
-      fi
-      metadata_file="${local_reference}/action.yaml"
-    fi
-    if [[ -z "${metadata_file}" ]] || [[ ! -f "${metadata_file}" ]] ||
-      [[ -L "${metadata_file}" ]]; then
-      echo "A local workflow action directory has no tracked regular action metadata." >&2
-      exit 1
-    fi
-
-    check_action_metadata_file "${metadata_file}"
-    return
+  if [[ "${workflow_file}" == "${oidc_workflow}" ]]; then
+    [[ "${job_permissions_count}" == "1" && "${id_token_count}" == "1" ]] ||
+      fail "OIDC workflow must grant id-token: write exactly once."
+    grep -Fqx '      id-token: write' "${workflow_file}" ||
+      fail "OIDC workflow must grant only its verification job an ID token."
+  elif [[ "${job_permissions_count}" != "0" ]]; then
+    fail "Unexpected job-level permissions block: ${workflow_file}"
+  elif [[ "${id_token_count}" != "0" ]]; then
+    fail "ID-token permission is only allowed in the OIDC workflow."
   fi
+done
 
-  if [[ "${action_reference}" =~ ^docker://[^@]+@sha256:[0-9a-f]{64}$ ]]; then
-    return
+immutable_action_pattern='^[[:space:]]+uses:[[:space:]]+[^[:space:]@]+/[^[:space:]@]+@[0-9a-f]{40}([[:space:]]+#[[:space:]]*.*)?$'
+action_reference_count=0
+while IFS= read -r action_line; do
+  action_reference_count=$((action_reference_count + 1))
+  [[ "${action_line}" =~ ${immutable_action_pattern} ]] ||
+    fail "GitHub Action reference is not pinned to an immutable commit: ${action_line}"
+done < <(grep -hE '^[[:space:]]+uses:' "${workflow_files[@]}" || true)
+
+deleted_bootstrap_scripts=(
+  infra/bootstrap/scripts/check-backend-contract.sh
+  infra/bootstrap/scripts/migrate-state.sh
+  infra/bootstrap/scripts/policy-contract-digest.sh
+  infra/bootstrap/scripts/render-s3-backend.sh
+  infra/bootstrap/scripts/test-backend-contract.sh
+  infra/bootstrap/scripts/test-migrate-state.sh
+  infra/bootstrap/scripts/test-render-s3-backend.sh
+  infra/bootstrap/scripts/test-verify-bootstrap-access.sh
+  infra/bootstrap/scripts/verify-bootstrap-access.sh
+)
+
+for deleted_script in "${deleted_bootstrap_scripts[@]}"; do
+  [[ ! -e "${deleted_script}" && ! -L "${deleted_script}" ]] ||
+    fail "Deleted bootstrap script has been restored: ${deleted_script}"
+
+  deleted_name="${deleted_script##*/}"
+  if git grep -I -q -F -e "${deleted_name}" -- "${content_pathspecs[@]}"; then
+    fail "Deleted bootstrap script is still referenced: ${deleted_name}"
   fi
-  if [[ ! "${action_reference}" =~ ^[^[:space:]@]+/[^[:space:]@]+@[0-9a-f]{40}$ ]]; then
-    echo "A third-party workflow action is not pinned to an immutable digest." >&2
-    exit 1
+done
+
+prohibited_commands=(
+  'terraform state push'
+  'terraform state pull'
+  'terraform state mv'
+  'terraform state rm'
+  'terraform init -force-copy'
+  'aws s3 cp'
+  'aws s3api put-object'
+)
+
+for prohibited_command in "${prohibited_commands[@]}"; do
+  if git grep -I -q -F -e "${prohibited_command}" -- \
+    "${content_pathspecs[@]}"; then
+    fail "Tracked content contains a prohibited custom state command: ${prohibited_command}"
   fi
+done
+
+credential_clear_block=$'unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN\nunset AWS_SECURITY_TOKEN AWS_CREDENTIAL_EXPIRATION\nunset AWS_WEB_IDENTITY_TOKEN_FILE AWS_ROLE_ARN AWS_ROLE_SESSION_NAME\nunset AWS_CONTAINER_CREDENTIALS_RELATIVE_URI\nunset AWS_CONTAINER_CREDENTIALS_FULL_URI\nunset AWS_CONTAINER_AUTHORIZATION_TOKEN\nunset AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE\nunset AWS_ENDPOINT_URL AWS_ENDPOINT_URL_STS AWS_ENDPOINT_URL_S3\nunset AWS_ENDPOINT_URL_IAM AWS_ENDPOINT_URL_BUDGETS\nunset AWS_S3_ENDPOINT AWS_STS_ENDPOINT AWS_IAM_ENDPOINT\nunset AWS_BUDGETS_ENDPOINT\nunset AWS_PROFILE AWS_DEFAULT_PROFILE\nunset TF_CLI_ARGS TF_CLI_ARGS_init TF_CLI_ARGS_plan\nunset TF_CLI_ARGS_apply TF_CLI_ARGS_state TF_CLI_ARGS_show\nunset TF_CLI_ARGS_output TF_DATA_DIR TF_WORKSPACE\nunset TF_VAR_terraform_admin_role_arn'
+
+for runbook in "${bootstrap_runbook}" "${verification_runbook}"; do
+  runbook_content="$(<"${runbook}")"
+  [[ "${runbook_content}" == *"${credential_clear_block}"* ]] ||
+    fail "Credential clearing is incomplete in ${runbook}."
+done
+
+bootstrap_identity_block=$'    .Account == $account and\n    .Arn == ("arn:aws:iam::" + $account +\n      ":user/opensearch-lab-bootstrap")'
+admin_identity_block=$'    .Account == $account and\n    (.Arn | test("^arn:aws:sts::" + $account +\n      ":assumed-role/opensearch-lab-terraform-admin/[^/]+$"))'
+bootstrap_content="$(<"${bootstrap_runbook}")"
+verification_content="$(<"${verification_runbook}")"
+
+[[ "${bootstrap_content}" == *"${bootstrap_identity_block}"* ]] ||
+  fail "Exact bootstrap-user identity check is missing from the bootstrap runbook."
+[[ "${bootstrap_content}" == *"${admin_identity_block}"* ]] ||
+  fail "Exact administration-role identity check is missing from the bootstrap runbook."
+[[ "${verification_content}" == *"${admin_identity_block}"* ]] ||
+  fail "Exact administration-role identity check is missing from the verification runbook."
+
+migration_command="terraform -chdir=\"\${module_dir}\" init -migrate-state"
+reconfiguration_command="terraform -chdir=\"\${module_dir}\" init -reconfigure"
+
+[[ "${bootstrap_content}" == *"${migration_command}"* ]] ||
+  fail "Fresh-account native state migration is not documented."
+[[ "${bootstrap_content}" == *"${reconfiguration_command}"* ]] ||
+  fail "Existing-account backend reconfiguration is not documented."
+[[ "${bootstrap_content}" == *'The existing installation is already S3-backed. It must never run the fresh'* ]] ||
+  fail "Fresh migration and existing-account reconfiguration are not clearly separated."
+
+require_link() {
+  local source_file="$1"
+  local link_target="$2"
+
+  grep -Fq -- "(${link_target})" "${source_file}" ||
+    fail "Required local documentation link is missing: ${source_file} -> ${link_target}"
 }
 
-while IFS= read -r workflow_file; do
-  [[ -n "${workflow_file}" ]] || continue
-  if [[ ! -f "${workflow_file}" ]] || [[ -L "${workflow_file}" ]]; then
-    echo "A workflow is not a tracked regular file." >&2
-    exit 1
-  fi
-  workflow_count=$((workflow_count + 1))
-  workflow_runner_count=0
-  check_restricted_yaml_keys "${workflow_file}"
+require_link README.md docs/aws/account-bootstrap.md
+require_link README.md docs/aws/verify-state.md
+require_link README.md docs/aws/bootstrap-security.md
+require_link README.md docs/aws/account-bootstrap-recovery.md
+require_link README.md docs/articles/aws-account-bootstrap-with-terraform.md
+require_link "${bootstrap_runbook}" verify-state.md
+require_link "${bootstrap_runbook}" account-bootstrap-recovery.md
+require_link "${bootstrap_runbook}" bootstrap-security.md
+require_link "${verification_runbook}" account-bootstrap.md
+require_link "${recovery_runbook}" account-bootstrap.md
+require_link "${security_document}" account-bootstrap.md
+require_link "${security_document}" account-bootstrap-recovery.md
 
-  while IFS= read -r runner_line; do
-    runner="${runner_line#*:}"
-    runner="${runner%%#*}"
-    runner="$(trim_whitespace "${runner}")"
-    workflow_runner_count=$((workflow_runner_count + 1))
-    runner_count=$((runner_count + 1))
-
-    if [[ "${runner}" != "ubuntu-24.04" ]]; then
-      echo "A workflow runner differs from the reviewed ubuntu-24.04 image." >&2
-      exit 1
-    fi
-  done < <(grep -E '^[[:space:]]*runs-on:' "${workflow_file}")
-
-  if ((workflow_runner_count == 0)); then
-    echo "A workflow has no explicit reviewed runner." >&2
-    exit 1
-  fi
-
-  while IFS= read -r uses_line; do
-    check_action_reference "$(extract_action_reference "${uses_line}")"
-  done < <(grep -E "${uses_pattern}" "${workflow_file}" || true)
-
-  while IFS= read -r reusable_workflow_line; do
-    reusable_workflow_reference="$(extract_action_reference \
-      "${reusable_workflow_line}")"
-    if [[ "${reusable_workflow_reference}" != ./* ]]; then
-      echo "External reusable-workflow jobs are not allowed." >&2
-      exit 1
-    fi
-  done < <(grep -E '^    uses[[:space:]]*:' "${workflow_file}" || true)
-
-  if [[ "${workflow_file}" != "${oidc_workflow}" ]] &&
-    grep -Eq "^    [\"']?permissions[\"']?[[:space:]]*:" "${workflow_file}"; then
-    echo "Job-level workflow permissions are not allowed." >&2
-    exit 1
-  fi
-
-  if grep -Eq '^[[:space:]]*(actions|attestations|checks|contents|deployments|discussions|issues|packages|pages|pull-requests|repository-projects|security-events|statuses):[[:space:]]*write([[:space:]]*#.*)?$' "${workflow_file}"; then
-    echo "A workflow grants an unreviewed write permission." >&2
-    exit 1
-  fi
-
-  id_token_count="$(grep -Ec '^[[:space:]]*id-token:[[:space:]]*write([[:space:]]*#.*)?$' "${workflow_file}" || true)"
-  if [[ "${workflow_file}" == "${oidc_workflow}" ]]; then
-    if [[ "${id_token_count}" != "1" ]]; then
-      echo "The manual AWS OIDC workflow differs from its reviewed token boundary." >&2
-      exit 1
-    fi
-    check_oidc_workflow_jobs
-  elif [[ "${id_token_count}" != "0" ]]; then
-    echo "ID-token write access exists outside the reviewed AWS OIDC workflow." >&2
-    exit 1
-  fi
-
-  actual_permissions="$(awk '
-    /^permissions:$/ { capture = 1 }
-    /^jobs:$/ { capture = 0 }
-    capture { print }
-  ' "${workflow_file}")"
-  if [[ "${workflow_file}" == "${oidc_workflow}" ]]; then
-    expected_permissions="${expected_oidc_permissions}"
-  else
-    expected_permissions="${expected_read_only_permissions}"
-  fi
-  if [[ "${actual_permissions}" != "${expected_permissions}" ]]; then
-    echo "A workflow permissions block differs from its reviewed contract." >&2
-    exit 1
-  fi
-done < <(git ls-files '.github/workflows/*.yml' '.github/workflows/*.yaml')
-
-while IFS= read -r -d '' action_metadata_file; do
-  check_action_metadata_file "${action_metadata_file}"
-done < <(git ls-files -z 'action.yml' 'action.yaml' '*/action.yml' '*/action.yaml')
-
-if ((workflow_count == 0 || runner_count == 0)); then
-  echo "No tracked workflows were inspected." >&2
-  exit 1
-fi
-
-printf 'Tracked repository safeguards passed: %d files, %d workflows, %d actions, %d runners.\n' \
-  "${tracked_file_count}" "${workflow_count}" "${action_count}" "${runner_count}"
+printf 'Tracked repository safeguards passed: %d files, %d pinned actions.\n' \
+  "${tracked_file_count}" "${action_reference_count}"

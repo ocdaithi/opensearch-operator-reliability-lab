@@ -1,21 +1,11 @@
 provider "aws" {
-  region = var.aws_region
-
-  dynamic "assume_role" {
-    for_each = var.terraform_admin_role_arn == null ? [] : [var.terraform_admin_role_arn]
-
-    content {
-      role_arn     = assume_role.value
-      session_name = "terraform-bootstrap-management"
-    }
-  }
+  region              = var.aws_region
+  allowed_account_ids = [var.expected_aws_account_id]
 
   default_tags {
     tags = local.common_tags
   }
 }
-
-data "aws_caller_identity" "current" {}
 
 data "aws_partition" "current" {}
 

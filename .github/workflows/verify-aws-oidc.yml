@@ -2,6 +2,11 @@ name: Verify AWS OIDC
 
 on:
   workflow_dispatch:
+    inputs:
+      environment:
+        description: Select the protected GitHub Environment to verify.
+        required: true
+        type: environment
 
 permissions:
   contents: none
@@ -27,7 +32,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       id-token: write
-    environment: aws-bootstrap
+    environment: ${{ inputs.environment }}
     timeout-minutes: 5
 
     steps:
@@ -35,7 +40,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           audience: sts.amazonaws.com
-          aws-region: eu-west-1
+          aws-region: ${{ vars.TF_VAR_aws_region }}
           mask-aws-account-id: true
           output-credentials: false
           role-duration-seconds: 900
