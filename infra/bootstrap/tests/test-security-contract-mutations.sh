@@ -412,7 +412,7 @@ run_structural_static_negative() {
         "${fixture_dir}/backend.s3.tf.example"
       ;;
     backend-example-role-assumption)
-      perl -0pi -e 's/backend "s3" \{\}/backend "s3" {\n    assume_role = {\n      role_arn = "arn:aws:iam::0000:role/unsafe"\n    }\n  }/' \
+      perl -0pi -e 's#backend "s3" \{\}#backend "s3" {\n    assume_role = {\n      role_arn = "arn:aws:iam::0000:role/unsafe"\n    }\n  }#' \
         "${fixture_dir}/backend.s3.tf.example"
       grep -Fq 'assume_role = {' "${fixture_dir}/backend.s3.tf.example"
       ;;
