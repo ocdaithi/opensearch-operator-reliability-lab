@@ -38,6 +38,9 @@ jobs:
       - name: Check formatting
         run: terraform fmt -check -recursive
 
+      - name: Configure isolated Terraform data directory
+        run: printf 'TF_DATA_DIR=%s\n' "${RUNNER_TEMP}/terraform-data" >> "${GITHUB_ENV}"
+
       - name: Initialise without a backend
         run: terraform init -backend=false -input=false
         working-directory: infra/bootstrap
